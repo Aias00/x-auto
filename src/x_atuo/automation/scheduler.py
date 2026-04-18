@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import queue
 import threading
 from typing import Any, Callable, Literal
@@ -19,6 +20,8 @@ from x_atuo.automation.state import AutomationRequest
 
 TriggerKind = Literal["cron", "interval", "date"]
 DispatchCallable = Callable[[AutomationRequest], Any]
+QueueFullCallable = Callable[[AutomationRequest], Any]
+logger = logging.getLogger(__name__)
 
 
 class ScheduledWorkflow(BaseModel):
@@ -40,10 +43,13 @@ class AutomationScheduler:
         settings: SchedulerSettings,
         dispatcher: DispatchCallable,
         *,
+        on_queue_full: QueueFullCallable | None = None,
         scheduler: BackgroundScheduler | None = None,
     ) -> None:
+        self._max_backlog = 5
         self.settings = settings
         self.dispatcher = dispatcher
+        self.on_queue_full = on_queue_full
         self.scheduler = scheduler or BackgroundScheduler(
             timezone=settings.timezone,
             job_defaults={
@@ -51,7 +57,7 @@ class AutomationScheduler:
                 "misfire_grace_time": settings.misfire_grace_time,
             },
         )
-        self._dispatch_queue: queue.Queue[AutomationRequest | None] = queue.Queue()
+        self._dispatch_queue: queue.Queue[AutomationRequest | None] = queue.Queue(maxsize=self._max_backlog)
         self._worker_thread: threading.Thread | None = None
 
     def start(self) -> None:
@@ -109,7 +115,17 @@ class AutomationScheduler:
 
     def _dispatch_job(self, request: AutomationRequest) -> None:
         self._ensure_worker_started()
-        self._dispatch_queue.put(request)
+        try:
+            self._dispatch_queue.put_nowait(request)
+        except queue.Full:
+            logger.warning("scheduler backlog full; dropping queued job", extra={"job_name": request.job_name})
+            if self.on_queue_full is not None:
+                try:
+                    result = self.on_queue_full(request)
+                    if inspect.isawaitable(result):
+                        asyncio.run(result)
+                except Exception:
+                    logger.exception("scheduler queue-full handler failed", extra={"job_name": request.job_name})
 
     def _ensure_worker_started(self) -> None:
         if self._worker_thread is not None and self._worker_thread.is_alive():
@@ -125,7 +141,13 @@ class AutomationScheduler:
         thread = self._worker_thread
         if thread is None:
             return
-        self._dispatch_queue.put(None)
+        if wait:
+            self._dispatch_queue.put(None)
+        else:
+            try:
+                self._dispatch_queue.put_nowait(None)
+            except queue.Full:
+                pass
         thread.join(timeout=5.0 if wait else 0.1)
         if not thread.is_alive():
             self._worker_thread = None
@@ -136,8 +158,11 @@ class AutomationScheduler:
             try:
                 if request is None:
                     return
-                result = self.dispatcher(request)
-                if inspect.isawaitable(result):
-                    asyncio.run(result)
+                try:
+                    result = self.dispatcher(request)
+                    if inspect.isawaitable(result):
+                        asyncio.run(result)
+                except Exception:
+                    logger.exception("scheduler worker failed to dispatch job", extra={"job_name": request.job_name})
             finally:
                 self._dispatch_queue.task_done()

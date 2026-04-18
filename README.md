@@ -15,7 +15,6 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 - `GET /healthz`
 - `GET /runs/{run_id}`
 - `POST /hooks/twitter/feed-engage`
-- `POST /hooks/twitter/explicit-engage`
 - `POST /hooks/twitter/repo-post`
 - `POST /hooks/twitter/direct-post`
 
@@ -24,7 +23,10 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 - Twitter execution reads credentials from `~/.agent-reach/config.yaml`
 - If `twitter_auth_token` / `twitter_ct0` are absent there, it falls back to `TWITTER_AUTH_TOKEN` and `TWITTER_CT0`
 - Proxy can be passed per request, or defaulted in automation config
-- `repo-post` currently uses deterministic GitHub fetching and deterministic text rendering, not LLM drafting yet
+- `feed-engage` runs AI candidate moderation before selection when an AI provider is configured; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out
+- `feed-engage` enriches candidates with full tweet text before moderation, selection, and reply drafting
+- scheduled `feed-engage` runs are queued behind a single in-process worker with a bounded backlog; when the backlog is full, new scheduled requests are recorded as blocked runs instead of silently disappearing
+- `repo-post` uses deterministic GitHub fetching, but can use AI drafting in `ai_auto` mode when an AI provider is configured
 - AI drafting/selection is optional
   - `X_ATUO_AI__PROVIDER=mock` enables deterministic fake AI for testing
   - `X_ATUO_AI__PROVIDER=openai_compatible` enables HTTP chat-completions calls
@@ -41,11 +43,11 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 ## Development
 
 ```bash
-cd /Users/aias/Work/github/x-atuo
+cd /Users/aias/workspace/x-atuo
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
+PYTHONPATH=src uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
 ```
 
 ## Example Calls
@@ -70,19 +72,6 @@ Feed engage real run with built-in defaults:
 curl -s -X POST http://127.0.0.1:18000/hooks/twitter/feed-engage \
   -H 'Content-Type: application/json' \
   -d '{}' | jq
-```
-
-Explicit engage dry-run:
-
-```bash
-curl -s -X POST http://127.0.0.1:18000/hooks/twitter/explicit-engage \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "tweet_id": "2044477537200550383",
-    "screen_name": "ShopifyEng",
-    "reply_text": "Interesting benchmark breakdown.",
-    "dry_run": true
-  }' | jq
 ```
 
 Repo post dry-run:

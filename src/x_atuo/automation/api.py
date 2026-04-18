@@ -16,7 +16,6 @@ from x_atuo.automation.config import AutomationConfig
 from x_atuo.automation.schemas import (
     FeedEngageRequest,
     DirectPostRequest,
-    ExplicitEngageRequest,
     HealthResponse,
     RepoPostRequest,
     RunLookupResponse,
@@ -59,6 +58,9 @@ async def _execute_job(
 ) -> dict[str, Any]:
     run_id = str(uuid4())
     job_id = requested_job_id or f"{job_type}-{run_id}"
+    normalized_result: Any = None
+    run_status = "failed"
+    error_message: str | None = None
 
     storage.upsert_job(job_id, job_type, config=payload)
     storage.create_run(
@@ -76,26 +78,32 @@ async def _execute_job(
     )
     storage.update_run(run_id, status="running", started_at=utcnow())
 
-    result = await _call_graph(
-        function_name,
-        run_id=run_id,
-        job_id=job_id,
-        payload=payload,
-        storage=storage,
-    )
-    normalized_result = _normalize_result(result)
-    run_status = _derive_status(normalized_result)
+    try:
+        result = await _call_graph(
+            function_name,
+            run_id=run_id,
+            job_id=job_id,
+            payload=payload,
+            storage=storage,
+        )
+        normalized_result = _normalize_result(result)
+        run_status = _derive_status(normalized_result)
+    except Exception as exc:
+        error_message = str(exc)
+        normalized_result = {"status": "failed", "error": error_message}
+
     storage.update_run(
         run_id,
         status=run_status,
         response_payload=normalized_result,
+        error=error_message,
         finished_at=utcnow(),
     )
     storage.add_audit_event(
         run_id=run_id,
         event_type="orchestration_finished",
         node="service",
-        payload={"status": run_status},
+        payload={"status": run_status, "error": error_message},
     )
     return {
         "run_id": run_id,
@@ -117,6 +125,40 @@ async def _dispatch_scheduled_request(request_obj: AutomationRequest, storage: A
         payload=payload,
         requested_job_id=request_obj.job_name,
     )
+
+
+def _record_dropped_scheduled_request(
+    request_obj: AutomationRequest,
+    storage: AutomationStorage,
+    *,
+    reason: str,
+) -> str:
+    job_type, _function_name, payload, endpoint = _workflow_binding(request_obj)
+    run_id = str(uuid4())
+    job_id = request_obj.job_name or f"{job_type}-{run_id}"
+    storage.upsert_job(job_id, job_type, config=payload)
+    storage.create_run(
+        run_id=run_id,
+        job_id=job_id,
+        job_type=job_type,
+        endpoint=endpoint,
+        request_payload=payload,
+        status="blocked",
+    )
+    storage.add_audit_event(
+        run_id=run_id,
+        event_type="scheduler_queue_dropped",
+        node="service",
+        payload={"endpoint": endpoint, "job_id": job_id, "reason": reason},
+    )
+    storage.update_run(
+        run_id,
+        status="blocked",
+        response_payload={"status": "blocked", "error": reason},
+        error=reason,
+        finished_at=utcnow(),
+    )
+    return run_id
 
 
 def _build_scheduled_feed_engage(settings: AutomationConfig) -> ScheduledWorkflow | None:
@@ -168,6 +210,11 @@ async def lifespan(app: FastAPI):
     scheduler = AutomationScheduler(
         settings.scheduler,
         lambda request_obj: _dispatch_scheduled_request(request_obj, storage),
+        on_queue_full=lambda request_obj: _record_dropped_scheduled_request(
+            request_obj,
+            storage,
+            reason="scheduler backlog full",
+        ),
     )
     definition = _build_scheduled_feed_engage(settings)
     if definition is not None:
@@ -312,25 +359,6 @@ async def feed_engage(payload: FeedEngageRequest, request: Request) -> WebhookAc
         endpoint="/hooks/twitter/feed-engage",
         job_type="feed_engage",
         function_name="run_feed_engage",
-        payload=payload.model_dump(mode="json", exclude_none=True),
-        requested_job_id=payload.job_id,
-    )
-
-
-@app.post(
-    "/hooks/twitter/explicit-engage",
-    response_model=WebhookAcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def explicit_engage(
-    payload: ExplicitEngageRequest,
-    request: Request,
-) -> WebhookAcceptedResponse:
-    return await _execute_webhook(
-        request=request,
-        endpoint="/hooks/twitter/explicit-engage",
-        job_type="explicit_engage",
-        function_name="run_explicit_engage",
         payload=payload.model_dump(mode="json", exclude_none=True),
         requested_job_id=payload.job_id,
     )

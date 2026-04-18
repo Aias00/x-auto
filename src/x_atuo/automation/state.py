@@ -20,7 +20,6 @@ class WorkflowKind(str, Enum):
     """Supported workflow types."""
 
     FEED_ENGAGE = "feed-engage"
-    EXPLICIT_ENGAGE = "explicit-engage"
     REPO_POST = "repo-post"
     DIRECT_POST = "direct-post"
 
@@ -123,8 +122,6 @@ class AutomationRequest(BaseModel):
 
         if self.workflow is WorkflowKind.FEED_ENGAGE and self.feed_options is None:
             self.feed_options = FeedOptions()
-        if self.workflow is WorkflowKind.EXPLICIT_ENGAGE and self.candidate is None:
-            raise ValueError("explicit-engage requires candidate")
         if self.workflow is WorkflowKind.REPO_POST and not self.repo_url:
             raise ValueError("repo-post requires repo_url")
         if self.workflow is WorkflowKind.DIRECT_POST and not self.post_text:
@@ -147,21 +144,6 @@ class AutomationRequest(BaseModel):
             candidate=candidate,
             candidates=candidates or [],
             feed_options=feed_options or FeedOptions(),
-            **kwargs,
-        )
-
-    @classmethod
-    def for_explicit_engage(
-        cls,
-        *,
-        candidate: FeedCandidate,
-        reply_text: str,
-        **kwargs: Any,
-    ) -> "AutomationRequest":
-        return cls(
-            workflow=WorkflowKind.EXPLICIT_ENGAGE,
-            candidate=candidate,
-            reply_text=reply_text,
             **kwargs,
         )
 

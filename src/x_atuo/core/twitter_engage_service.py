@@ -10,6 +10,7 @@ from x_atuo.core.twitter_models import (
     CandidateAttempt,
     EngageResult,
     PostResult,
+    TweetRecord,
     TwitterCommandResult,
 )
 
@@ -73,31 +74,36 @@ class TwitterEngageService:
             return EngageResult(ok=False, status="failed", error="Missing Twitter credentials")
 
         for candidate in candidates:
-            try:
-                main_tweet = self.client.fetch_tweet(candidate.tweet_id)
-            except TwitterClientError as exc:
-                attempts.append(
-                    CandidateAttempt(
-                        candidate=candidate,
-                        tweet_id=candidate.tweet_id,
-                        screen_name=candidate.screen_name,
-                        outcome="tweet_fetch_failed",
-                        detail=str(exc),
+            main_tweet: TweetRecord
+            if candidate.tweet is not None:
+                main_tweet = candidate.tweet
+            else:
+                try:
+                    main_tweet = self.client.fetch_tweet(candidate.tweet_id)
+                except TwitterClientError as exc:
+                    attempts.append(
+                        CandidateAttempt(
+                            candidate=candidate,
+                            tweet_id=candidate.tweet_id,
+                            screen_name=candidate.screen_name,
+                            outcome="tweet_fetch_failed",
+                            detail=str(exc),
+                        )
                     )
-                )
-                return EngageResult(
-                    ok=False,
-                    status="failed",
-                    attempts=tuple(attempts),
-                    selected_candidate=candidate,
-                    error=str(exc),
-                )
+                    return EngageResult(
+                        ok=False,
+                        status="failed",
+                        attempts=tuple(attempts),
+                        selected_candidate=candidate,
+                        error=str(exc),
+                    )
 
             actual_screen_name = main_tweet.author.screen_name or candidate.screen_name
             resolved_candidate = Candidate(
                 tweet_id=candidate.tweet_id,
                 screen_name=actual_screen_name,
                 reply_text=candidate.reply_text,
+                tweet=main_tweet,
             )
 
             if not main_tweet.author.verified:

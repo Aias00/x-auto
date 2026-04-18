@@ -64,6 +64,7 @@ class Candidate:
     tweet_id: str
     screen_name: str
     reply_text: str
+    tweet: TweetRecord | None = None
 
 
 @dataclass(slots=True, frozen=True)

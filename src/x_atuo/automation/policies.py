@@ -116,20 +116,13 @@ def evaluate_policy(
 
     decisions: list[PolicyDecision] = []
     now = now or datetime.now(UTC)
-    limit = config.max_reply_length if request.workflow in {
-        WorkflowKind.FEED_ENGAGE,
-        WorkflowKind.EXPLICIT_ENGAGE,
-    } else config.max_post_length
+    limit = config.max_reply_length if request.workflow is WorkflowKind.FEED_ENGAGE else config.max_post_length
     decisions.append(check_text_length(text, limit=limit))
 
     dedupe_key = build_dedupe_key(request, candidate=candidate, text=text)
     dedupe = PolicyDecision(dedupe_key=dedupe_key)
     if config.enforce_dedupe and hooks:
-        if (
-            request.workflow in {WorkflowKind.FEED_ENGAGE, WorkflowKind.EXPLICIT_ENGAGE}
-            and candidate is not None
-            and hooks.has_target_tweet_id(candidate.tweet_id)
-        ):
+        if request.workflow is WorkflowKind.FEED_ENGAGE and candidate is not None and hooks.has_target_tweet_id(candidate.tweet_id):
             dedupe.allowed = False
             dedupe.reasons.append("target tweet already engaged")
         elif hooks.has_dedupe_key(dedupe_key):

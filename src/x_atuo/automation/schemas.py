@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 JobMode = Literal["deterministic", "ai_auto"]
 RunStatus = Literal["queued", "running", "completed", "failed", "blocked"]
 FeedType = Literal["following", "for-you"]
-JobType = Literal["feed_engage", "explicit_engage", "repo_post", "direct_post"]
+JobType = Literal["feed_engage", "repo_post", "direct_post"]
 
 
 class StrictModel(BaseModel):
@@ -28,12 +28,6 @@ class FeedEngageRequest(BaseWebhookRequest):
     feed_count: int = Field(default=5, ge=1, le=100)
     feed_type: FeedType = "for-you"
     reply_template: str | None = None
-
-
-class ExplicitEngageRequest(BaseWebhookRequest):
-    tweet_id: str = Field(min_length=1, max_length=64)
-    screen_name: str | None = None
-    reply_text: str = Field(min_length=1, max_length=280)
 
 
 class RepoPostRequest(BaseWebhookRequest):

@@ -24,12 +24,12 @@ from x_atuo.automation.state import (
     WorkflowStateModel,
     make_initial_state,
 )
-from x_atuo.core.ai_client import AIProviderError, build_ai_provider
+from x_atuo.core.ai_client import AIModerationResult, AIProviderError, build_ai_provider
 from x_atuo.core.github_repo_client import fetch_repo_context as fetch_github_repo_context
 from x_atuo.core.github_repo_client import render_repo_post_text
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_engage_service import TwitterEngageService
-from x_atuo.core.twitter_models import Candidate
+from x_atuo.core.twitter_models import Candidate, TweetRecord
 
 StateCallable = Callable[[WorkflowStateModel], Any]
 
@@ -55,6 +55,7 @@ def fetch_repo_context(repo_url: str) -> dict[str, Any]:
 @dataclass(slots=True)
 class WorkflowAdapters:
     fetch_feed: StateCallable | None = None
+    moderate_candidates: StateCallable | None = None
     select_candidate: StateCallable | None = None
     load_repo_context: StateCallable | None = None
     draft_reply: StateCallable | None = None
@@ -86,6 +87,7 @@ class AutomationGraph:
         workflow = StateGraph(AutomationGraphState)
         workflow.add_node("prepare", self.prepare)
         workflow.add_node("fetch_feed", self.fetch_feed)
+        workflow.add_node("moderate_candidates", self.moderate_candidates)
         workflow.add_node("select_candidate", self.select_candidate)
         workflow.add_node("load_repo_context", self.load_repo_context)
         workflow.add_node("draft_text", self.draft_text)
@@ -104,7 +106,24 @@ class AutomationGraph:
                 "draft_text": "draft_text",
             },
         )
-        workflow.add_edge("fetch_feed", "select_candidate")
+        workflow.add_conditional_edges(
+            "fetch_feed",
+            self.route_after_fetch_feed,
+            {
+                "moderate_candidates": "moderate_candidates",
+                "select_candidate": "select_candidate",
+                "finalize": "finalize",
+            },
+        )
+        workflow.add_conditional_edges(
+            "moderate_candidates",
+            self.route_after_moderation,
+            {
+                "select_candidate": "select_candidate",
+                "blocked": "blocked",
+                "finalize": "finalize",
+            },
+        )
         workflow.add_edge("select_candidate", "draft_text")
         workflow.add_edge("load_repo_context", "draft_text")
         workflow.add_edge("draft_text", "policy_guard")
@@ -127,8 +146,6 @@ class AutomationGraph:
         snapshot.status = RunStatus.RUNNING
         if snapshot.request.candidates:
             snapshot.candidates = list(snapshot.request.candidates)
-        if snapshot.request.workflow is WorkflowKind.EXPLICIT_ENGAGE and snapshot.request.candidate:
-            snapshot.selected_candidate = snapshot.request.candidate
         if snapshot.request.metadata.get("frozen_selection_source"):
             snapshot.selection_source = str(snapshot.request.metadata["frozen_selection_source"])
         if snapshot.request.metadata.get("frozen_selection_reason"):
@@ -142,8 +159,6 @@ class AutomationGraph:
         workflow = state["snapshot"].request.workflow
         if workflow is WorkflowKind.FEED_ENGAGE:
             return "fetch_feed"
-        if workflow is WorkflowKind.EXPLICIT_ENGAGE:
-            return "select_candidate"
         if workflow is WorkflowKind.REPO_POST:
             return "load_repo_context"
         return "draft_text"
@@ -162,6 +177,72 @@ class AutomationGraph:
         if not snapshot.candidates:
             snapshot.mark_failed("feed returned no candidates", node="fetch_feed")
         return {"snapshot": snapshot}
+
+    def route_after_fetch_feed(self, state: AutomationGraphState) -> str:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
+            return "finalize"
+        if self.adapters.moderate_candidates is not None:
+            return "moderate_candidates"
+        return "select_candidate"
+
+    async def moderate_candidates(self, state: AutomationGraphState) -> AutomationGraphState:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
+            return {"snapshot": snapshot}
+        if self.adapters.moderate_candidates is None or not snapshot.candidates:
+            return {"snapshot": snapshot}
+        try:
+            moderation_results = await maybe_await(self.adapters.moderate_candidates(snapshot))
+        except AIProviderError as exc:
+            snapshot.mark_blocked([f"ai moderation failed: {exc}"], node="moderate_candidates")
+            return {"snapshot": snapshot}
+        moderation_by_tweet_id = {result.tweet_id: result for result in moderation_results or []}
+        filtered_candidates: list[FeedCandidate] = []
+        filtered_count = 0
+        for candidate in snapshot.candidates:
+            moderation = moderation_by_tweet_id.get(candidate.tweet_id)
+            if moderation is None:
+                filtered_count += 1
+                snapshot.log_event(
+                    "moderate_candidates",
+                    "candidate filtered by ai moderation",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    category="missing_decision",
+                    reason="candidate missing from ai moderation results",
+                )
+                continue
+            if not moderation.allowed:
+                filtered_count += 1
+                snapshot.log_event(
+                    "moderate_candidates",
+                    "candidate filtered by ai moderation",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    category=moderation.category,
+                    reason=moderation.reason,
+                )
+                continue
+            filtered_candidates.append(candidate)
+        snapshot.candidates = filtered_candidates
+        snapshot.log_event(
+            "moderate_candidates",
+            "ai moderation completed",
+            kept=len(filtered_candidates),
+            filtered=filtered_count,
+        )
+        if not snapshot.candidates:
+            snapshot.mark_blocked(["all candidates filtered by ai moderation"], node="moderate_candidates")
+        return {"snapshot": snapshot}
+
+    def route_after_moderation(self, state: AutomationGraphState) -> str:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.BLOCKED:
+            return "blocked"
+        if snapshot.status is RunStatus.FAILED:
+            return "finalize"
+        return "select_candidate"
 
     async def select_candidate(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
@@ -212,7 +293,7 @@ class AutomationGraph:
         if snapshot.status is RunStatus.FAILED:
             return {"snapshot": snapshot}
         workflow = snapshot.request.workflow
-        if workflow in {WorkflowKind.FEED_ENGAGE, WorkflowKind.EXPLICIT_ENGAGE}:
+        if workflow is WorkflowKind.FEED_ENGAGE:
             if snapshot.request.reply_text:
                 snapshot.rendered_text = snapshot.request.reply_text
             elif self.adapters.draft_reply is not None:
@@ -319,7 +400,7 @@ class AutomationGraph:
     async def execute(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
         workflow = snapshot.request.workflow
-        if workflow in {WorkflowKind.FEED_ENGAGE, WorkflowKind.EXPLICIT_ENGAGE}:
+        if workflow is WorkflowKind.FEED_ENGAGE:
             if self.adapters.execute_engage is None:
                 snapshot.mark_failed("execute_engage adapter not configured", node="execute")
                 return {"snapshot": snapshot}
@@ -377,7 +458,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             except AIProviderError as exc:
                 snapshot.log_event("draft_reply", "ai draft failed, using fallback", error=str(exc))
         snapshot.drafting_source = "deterministic"
-        return snapshot.request.reply_text or "Interesting work here."
+        return snapshot.request.reply_text or "The real win here is how much complexity this strips out."
 
     def draft_post(snapshot: WorkflowStateModel):
         if snapshot.request.post_text:
@@ -428,6 +509,32 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         snapshot.selection_source = "deterministic"
         return snapshot.candidates[0] if snapshot.candidates else None
 
+    def moderate_candidates(snapshot: WorkflowStateModel):
+        if ai_provider is None or not snapshot.candidates:
+            return []
+        moderate = getattr(ai_provider, "moderate_candidates", None)
+        if moderate is None:
+            return []
+        fetch_failures: list[AIModerationResult] = []
+        for candidate in snapshot.candidates:
+            try:
+                tweet = service.client.fetch_tweet(candidate.tweet_id)
+            except Exception as exc:
+                fetch_failures.append(
+                    AIModerationResult(
+                        tweet_id=candidate.tweet_id,
+                        allowed=False,
+                        category="tweet_fetch_failed",
+                        reason=f"could not fetch full tweet for moderation: {exc}",
+                    )
+                )
+                continue
+            candidate.screen_name = tweet.screen_name or candidate.screen_name
+            candidate.text = tweet.text or candidate.text
+            candidate.author_verified = tweet.verified
+            candidate.metadata = tweet.raw
+        return [*moderate(snapshot.candidates), *fetch_failures]
+
     def execute_engage(snapshot: WorkflowStateModel):
         candidate = snapshot.selected_candidate
         if candidate is None:
@@ -443,6 +550,13 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                     tweet_id=candidate_item.tweet_id,
                     screen_name=candidate_item.screen_name or "",
                     reply_text=snapshot.rendered_text or snapshot.request.reply_text or "",
+                    tweet=(
+                        TweetRecord.from_payload(candidate_item.metadata)
+                        if isinstance(candidate_item.metadata, dict)
+                        and candidate_item.metadata.get("id")
+                        and candidate_item.metadata.get("author")
+                        else None
+                    ),
                 )
                 for candidate_item in ordered_candidates
             ],
@@ -521,6 +635,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         config,
         WorkflowAdapters(
             fetch_feed=fetch_feed,
+            moderate_candidates=moderate_candidates if getattr(ai_provider, "moderate_candidates", None) is not None else None,
             select_candidate=select_candidate,
             load_repo_context=load_repo_context,
             draft_reply=draft_reply,
@@ -583,21 +698,6 @@ async def run_feed_engage(*, run_id: str, job_id: str, payload: dict[str, Any], 
             feed_type=payload.get("feed_type", config.twitter.default_feed_type),
             feed_count=payload.get("feed_count", config.twitter.default_feed_count),
         ),
-        metadata=payload.get("metadata", {}),
-        idempotency_key=payload.get("idempotency_key"),
-    )
-    return await _run_request(request, storage=storage, proxy=payload.get("proxy") or config.twitter.proxy_url)
-
-
-async def run_explicit_engage(*, run_id: str, job_id: str, payload: dict[str, Any], storage: Any) -> dict[str, Any]:
-    config = AutomationConfig()
-    request = AutomationRequest.for_explicit_engage(
-        job_name=job_id,
-        run_id=run_id,
-        dry_run=bool(payload.get("dry_run", False)),
-        approval_mode=payload.get("mode", "ai_auto"),
-        reply_text=payload["reply_text"],
-        candidate=FeedCandidate(tweet_id=payload["tweet_id"], screen_name=payload.get("screen_name")),
         metadata=payload.get("metadata", {}),
         idempotency_key=payload.get("idempotency_key"),
     )

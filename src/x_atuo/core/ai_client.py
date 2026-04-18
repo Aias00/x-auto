@@ -28,8 +28,19 @@ class AIDraftResult:
     rationale: str
 
 
+@dataclass(slots=True, frozen=True)
+class AIModerationResult:
+    tweet_id: str
+    allowed: bool
+    category: str | None
+    reason: str
+
+
 class BaseAIProvider:
     def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
+        raise NotImplementedError
+
+    def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         raise NotImplementedError
 
     def draft_reply(self, candidate: FeedCandidate) -> AIDraftResult:
@@ -51,10 +62,21 @@ class MockAIProvider(BaseAIProvider):
             reason="mock provider selected the richest candidate text",
         )
 
+    def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
+        return [
+            AIModerationResult(
+                tweet_id=candidate.tweet_id,
+                allowed=True,
+                category=None,
+                reason="mock provider kept candidate",
+            )
+            for candidate in candidates
+        ]
+
     def draft_reply(self, candidate: FeedCandidate) -> AIDraftResult:
         handle = candidate.screen_name or "author"
         return AIDraftResult(
-            text=f"Interesting point, @{handle}. Curious how you’re thinking about the next technical bottleneck here.",
+            text=f"@{handle} The real shift here is where the bottleneck moves next.",
             rationale="mock provider generated a shorter technical reply",
         )
 
@@ -135,9 +157,31 @@ class OpenAICompatibleProvider(BaseAIProvider):
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AIProviderError(f"Could not parse AI selection response: {content}") from exc
 
+    def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
+        content = self._chat(
+            "Review Twitter feed candidates for reply safety. Reject anything about politics, crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, or case news. Allow technical, product, engineering, and builder content. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
+            json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
+        )
+        try:
+            parsed = self._parse_json_content(content)
+            raw_results = parsed["results"]
+            if not isinstance(raw_results, list):
+                raise TypeError("results must be a list")
+            return [
+                AIModerationResult(
+                    tweet_id=str(item["tweet_id"]),
+                    allowed=bool(item["allowed"]),
+                    category=str(item["category"]) if item.get("category") is not None else None,
+                    reason=str(item.get("reason") or ""),
+                )
+                for item in raw_results
+            ]
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise AIProviderError(f"Could not parse AI moderation response: {content}") from exc
+
     def draft_reply(self, candidate: FeedCandidate) -> AIDraftResult:
         content = self._chat(
-            "Draft one short technical Twitter reply under 100 chars. Use one idea only. No lists. At most one short question. Return JSON with text and rationale.",
+            "Draft one short technical Twitter reply under 100 chars. Write like a sharp practitioner, not a summarizer. Lead with a judgment, useful angle, or tension. Keep it conversational and plainspoken. Prefer a direct statement, not a question. Avoid generic praise, repetition, and restating the post. One or two short sentences. No lists. No emojis. Return JSON with text and rationale.",
             json.dumps(candidate.model_dump(mode="json"), ensure_ascii=False),
         )
         try:
