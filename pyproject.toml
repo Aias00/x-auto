@@ -1,0 +1,32 @@
+[project]
+name = "x-atuo"
+version = "0.1.0"
+description = "Webhook and scheduled Twitter automation service built on Agent Reach patterns."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn>=0.30",
+  "apscheduler>=3.10",
+  "langgraph>=0.2.60",
+  "langchain-core>=0.3",
+  "pydantic>=2.8",
+  "pydantic-settings>=2.4",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.27",
+  "pytest>=8.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/x_atuo"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
