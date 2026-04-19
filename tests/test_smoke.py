@@ -1546,3 +1546,213 @@ def test_feed_engage_falls_back_after_reply_restricted(monkeypatch, tmp_path: Pa
     attempts = body["result"]["result"]["detail"]["attempts"]
     assert attempts[0]["outcome"] == "reply_restricted"
     assert attempts[1]["outcome"] == "replied"
+
+
+def test_feed_engage_draft_reply_uses_author_history_and_reply_context(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified, "name": "Tech Dev Notes"},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified, "name": "Tech Dev Notes"})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff")
+
+        def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5):
+            return (
+                FakeTweet(tweet_id, "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff"),
+                [
+                    FakeTweet("r1", "calebwachter", "Current Grok iterations employ live search; you can watch them do it in multi-agent mode."),
+                    FakeTweet("r2", "buildertwo", "The bigger question is whether retrieval is the default path in product UX."),
+                ],
+            )
+
+        def fetch_user_profile(self, screen_name: str):
+            return {
+                "screen_name": screen_name,
+                "name": "Tech Dev Notes",
+                "verified": True,
+                "description": "AI product notes and model updates",
+            }
+
+        def fetch_user_posts(self, screen_name: str, *, max_items: int = 5):
+            return [
+                FakeTweet("h1", screen_name, "Model evals matter more than benchmark headlines."),
+                FakeTweet("h2", screen_name, "Latency and orchestration still decide production UX."),
+                FakeTweet("h3", screen_name, "Retrieval quality is where a lot of assistants still break down."),
+                FakeTweet("h4", screen_name, "Tool calling is only useful if the fallback path is visible."),
+                FakeTweet("h5", screen_name, "A newer cutoff helps, but product behavior matters more."),
+            ]
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": True, "category": None, "reason": "technical"})()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type("Selection", (), {"tweet_id": "111", "reason": "time-sensitive model update"})()
+
+        def plan_reply_context(self, candidate, context):
+            assert context["author_profile"]["screen_name"] == "techdevnotes"
+            assert len(context["author_recent_posts"]) == 5
+            assert "live search" in context["existing_replies_summary"]
+            return type(
+                "Plan",
+                (),
+                {
+                    "needs_live_search": False,
+                    "search_query": None,
+                    "acknowledgment": "December 2025 is still a pretty fresh cutoff.",
+                    "fuller_angle": "The more important product question is whether live retrieval is the default path.",
+                    "rationale": "Use surrounding context before framing this as a gap.",
+                },
+            )()
+
+        def draft_reply(self, candidate, context=None):
+            assert context is not None
+            assert context["reply_brief"]["acknowledgment"] == "December 2025 is still a pretty fresh cutoff."
+            assert context["reply_brief"]["fuller_angle"].startswith("The more important product question")
+            return type(
+                "Draft",
+                (),
+                {
+                    "text": "December 2025 is still a pretty fresh cutoff. The bigger question is whether live retrieval is the default path.",
+                    "rationale": "acknowledge then extend",
+                },
+            )()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "reply-context.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["result"]["rendered_text"].startswith("December 2025 is still a pretty fresh cutoff.")
+
+
+def test_feed_engage_uses_live_search_when_context_plan_requests_it(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified, "name": "Tech Dev Notes"},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified, "name": "Tech Dev Notes"})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff")
+
+        def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5):
+            return (FakeTweet(tweet_id, "techdevnotes", "Grok 4.3 has December 2025 knowledge cutoff"), [])
+
+        def fetch_user_profile(self, screen_name: str):
+            return {"screen_name": screen_name, "name": "Tech Dev Notes", "verified": True}
+
+        def fetch_user_posts(self, screen_name: str, *, max_items: int = 5):
+            return [FakeTweet("h1", screen_name, "Recent launch notes")]
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": True, "category": None, "reason": "technical"})()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type("Selection", (), {"tweet_id": "111", "reason": "needs current context"})()
+
+        def plan_reply_context(self, candidate, context):
+            return type(
+                "Plan",
+                (),
+                {
+                    "needs_live_search": True,
+                    "search_query": "Grok 4.3 December 2025 knowledge cutoff live search",
+                    "acknowledgment": "December 2025 sounds recent enough on its own.",
+                    "fuller_angle": "Check whether the product already closes the gap with live retrieval.",
+                    "rationale": "This depends on current product behavior.",
+                },
+            )()
+
+        def draft_reply(self, candidate, context=None):
+            assert context is not None
+            assert context["knowledge_evidence"][0]["snippet"] == "Grok can search X and the web in real time."
+            return type(
+                "Draft",
+                (),
+                {
+                    "text": "December 2025 already sounds pretty fresh. The real question is whether live retrieval is always on.",
+                    "rationale": "used live evidence",
+                },
+            )()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setattr(
+        "x_atuo.automation.graph.search_web_context",
+        lambda query, max_results=3: [{"title": "About Grok", "snippet": "Grok can search X and the web in real time.", "url": "https://help.x.com/en/using-x/about-grok"}],
+        raising=False,
+    )
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "reply-live-search.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["result"]["rendered_text"].startswith("December 2025 already sounds pretty fresh.")

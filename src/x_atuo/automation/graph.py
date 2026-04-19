@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import inspect
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote_plus, unquote
+from urllib.request import Request, urlopen
 
 from langgraph.graph import END, StateGraph
 
@@ -24,7 +29,7 @@ from x_atuo.automation.state import (
     WorkflowStateModel,
     make_initial_state,
 )
-from x_atuo.core.ai_client import AIModerationResult, AIProviderError, build_ai_provider
+from x_atuo.core.ai_client import AIReplyContextPlan, AIModerationResult, AIProviderError, build_ai_provider
 from x_atuo.core.github_repo_client import fetch_repo_context as fetch_github_repo_context
 from x_atuo.core.github_repo_client import render_repo_post_text
 from x_atuo.core.twitter_client import TwitterClient
@@ -52,11 +57,89 @@ def fetch_repo_context(repo_url: str) -> dict[str, Any]:
     }
 
 
+def _strip_html_tags(value: str) -> str:
+    return re.sub(r"<[^>]+>", " ", value)
+
+
+def search_web_context(query: str, max_results: int = 3) -> list[dict[str, str]]:
+    if not query.strip():
+        return []
+    request = Request(
+        f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            html = response.read().decode("utf-8", errors="ignore")
+    except (HTTPError, URLError, TimeoutError):
+        return []
+
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>(?P<body>.*?)(?:</div>|<a[^>]+class="result__a")',
+        re.DOTALL,
+    )
+    results: list[dict[str, str]] = []
+    for match in pattern.finditer(html):
+        body = match.group("body")
+        snippet_match = re.search(r'class="result__snippet"[^>]*>(?P<snippet>.*?)</', body, re.DOTALL)
+        snippet = unescape(_strip_html_tags(snippet_match.group("snippet"))).strip() if snippet_match else ""
+        title = unescape(_strip_html_tags(match.group("title"))).strip()
+        url = unquote(match.group("url"))
+        if url.startswith("//duckduckgo.com/l/?uddg="):
+            url = url.split("uddg=", 1)[-1].split("&", 1)[0]
+            url = unquote(url)
+        results.append({"title": title, "snippet": snippet, "url": url})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _tweet_to_context(tweet: TweetRecord) -> dict[str, Any]:
+    author = getattr(tweet, "author", None)
+    return {
+        "tweet_id": tweet.tweet_id,
+        "screen_name": tweet.screen_name,
+        "text": tweet.text,
+        "verified": tweet.verified,
+        "author_name": getattr(author, "name", None),
+        "url": f"https://x.com/{tweet.screen_name}/status/{tweet.tweet_id}" if tweet.screen_name else None,
+    }
+
+
+def _summarize_replies(replies: list[TweetRecord]) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for reply in replies:
+        text = (reply.text or "").strip()
+        if not text:
+            continue
+        normalized = text.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        handle = f"@{reply.screen_name}" if reply.screen_name else "reply"
+        lines.append(f"{handle}: {text}")
+        if len(lines) >= 3:
+            break
+    return " | ".join(lines)
+
+
+def _call_with_optional_context(method: Callable[..., Any], *args: Any) -> Any:
+    try:
+        params = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return method(*args[:1])
+    if len(params) >= len(args):
+        return method(*args)
+    return method(*args[:1])
+
+
 @dataclass(slots=True)
 class WorkflowAdapters:
     fetch_feed: StateCallable | None = None
     moderate_candidates: StateCallable | None = None
     select_candidate: StateCallable | None = None
+    enrich_reply_context: StateCallable | None = None
     load_repo_context: StateCallable | None = None
     draft_reply: StateCallable | None = None
     draft_post: StateCallable | None = None
@@ -89,6 +172,7 @@ class AutomationGraph:
         workflow.add_node("fetch_feed", self.fetch_feed)
         workflow.add_node("moderate_candidates", self.moderate_candidates)
         workflow.add_node("select_candidate", self.select_candidate)
+        workflow.add_node("enrich_reply_context", self.enrich_reply_context)
         workflow.add_node("load_repo_context", self.load_repo_context)
         workflow.add_node("draft_text", self.draft_text)
         workflow.add_node("policy_guard", self.policy_guard)
@@ -124,7 +208,8 @@ class AutomationGraph:
                 "finalize": "finalize",
             },
         )
-        workflow.add_edge("select_candidate", "draft_text")
+        workflow.add_edge("select_candidate", "enrich_reply_context")
+        workflow.add_edge("enrich_reply_context", "draft_text")
         workflow.add_edge("load_repo_context", "draft_text")
         workflow.add_edge("draft_text", "policy_guard")
         workflow.add_conditional_edges(
@@ -268,6 +353,24 @@ class AutomationGraph:
                 tweet_id=snapshot.selected_candidate.tweet_id,
                 screen_name=snapshot.selected_candidate.screen_name,
                 selected_by=snapshot.selection_source,
+            )
+        return {"snapshot": snapshot}
+
+    async def enrich_reply_context(self, state: AutomationGraphState) -> AutomationGraphState:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
+            return {"snapshot": snapshot}
+        if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE or snapshot.selected_candidate is None:
+            return {"snapshot": snapshot}
+        if self.adapters.enrich_reply_context is None:
+            return {"snapshot": snapshot}
+        snapshot.reply_context = await maybe_await(self.adapters.enrich_reply_context(snapshot)) or {}
+        if snapshot.reply_context:
+            snapshot.log_event(
+                "enrich_reply_context",
+                "reply context ready",
+                has_search=bool(snapshot.reply_context.get("knowledge_evidence")),
+                author_posts=len(snapshot.reply_context.get("author_recent_posts") or []),
             )
         return {"snapshot": snapshot}
 
@@ -448,16 +551,119 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         raw = fetch_repo_context(snapshot.request.repo_url or "")
         return RepoContext(**raw)
 
+    def enrich_reply_context(snapshot: WorkflowStateModel):
+        candidate = snapshot.selected_candidate
+        if candidate is None or snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE:
+            return {}
+
+        replies: list[TweetRecord] = []
+        main_tweet: TweetRecord | None = None
+        fetch_thread = getattr(service.client, "fetch_tweet_thread", None)
+        if fetch_thread is not None:
+            try:
+                main_tweet, replies = fetch_thread(candidate.tweet_id, max_replies=5)
+            except Exception as exc:
+                snapshot.log_event("enrich_reply_context", "tweet thread unavailable", error=str(exc))
+                main_tweet = None
+                replies = []
+        if main_tweet is None:
+            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            if metadata.get("id") and metadata.get("author"):
+                main_tweet = TweetRecord.from_payload(metadata)
+            else:
+                main_tweet = TweetRecord.from_payload(
+                    {
+                        "id": candidate.tweet_id,
+                        "text": candidate.text or "",
+                        "author": {
+                            "screenName": candidate.screen_name or "",
+                            "verified": bool(candidate.author_verified),
+                        },
+                    }
+                )
+
+        candidate.screen_name = main_tweet.screen_name or candidate.screen_name
+        candidate.text = main_tweet.text or candidate.text
+        candidate.author_verified = main_tweet.verified
+        if main_tweet.raw:
+            candidate.metadata = main_tweet.raw
+
+        author_profile: dict[str, Any] = {}
+        if candidate.screen_name and getattr(service.client, "fetch_user_profile", None) is not None:
+            try:
+                author_profile = service.client.fetch_user_profile(candidate.screen_name)
+            except Exception as exc:
+                snapshot.log_event("enrich_reply_context", "author profile unavailable", error=str(exc))
+
+        author_recent_posts: list[dict[str, Any]] = []
+        if candidate.screen_name and getattr(service.client, "fetch_user_posts", None) is not None:
+            try:
+                recent_posts = service.client.fetch_user_posts(candidate.screen_name, max_items=5)
+                author_recent_posts = [
+                    _tweet_to_context(tweet)
+                    for tweet in recent_posts
+                    if tweet.tweet_id != candidate.tweet_id
+                ][:5]
+            except Exception as exc:
+                snapshot.log_event("enrich_reply_context", "author history unavailable", error=str(exc))
+
+        context: dict[str, Any] = {
+            "target_post": _tweet_to_context(main_tweet),
+            "author_profile": author_profile,
+            "author_recent_posts": author_recent_posts,
+            "existing_replies": [_tweet_to_context(reply) for reply in replies[:5]],
+            "existing_replies_summary": _summarize_replies(replies),
+            "knowledge_evidence": [],
+        }
+
+        if ai_provider and snapshot.request.approval_mode == "ai_auto":
+            planner = getattr(ai_provider, "plan_reply_context", None)
+            if planner is not None:
+                try:
+                    plan = _call_with_optional_context(planner, candidate, context)
+                    context["reply_brief"] = {
+                        "acknowledgment": getattr(plan, "acknowledgment", "") or "",
+                        "fuller_angle": getattr(plan, "fuller_angle", "") or "",
+                        "rationale": getattr(plan, "rationale", "") or "",
+                        "needs_live_search": bool(getattr(plan, "needs_live_search", False)),
+                        "search_query": getattr(plan, "search_query", None),
+                    }
+                    snapshot.log_event(
+                        "enrich_reply_context",
+                        "reply context planned",
+                        needs_live_search=context["reply_brief"]["needs_live_search"],
+                        search_query=context["reply_brief"]["search_query"],
+                    )
+                    if context["reply_brief"]["needs_live_search"] and context["reply_brief"]["search_query"]:
+                        context["knowledge_evidence"] = search_web_context(str(context["reply_brief"]["search_query"]), max_results=3)
+                        snapshot.log_event(
+                            "enrich_reply_context",
+                            "live search enriched reply context",
+                            query=context["reply_brief"]["search_query"],
+                            results=len(context["knowledge_evidence"]),
+                        )
+                except AIProviderError as exc:
+                    snapshot.log_event("enrich_reply_context", "reply context planning failed", error=str(exc))
+
+        return context
+
     def draft_reply(snapshot: WorkflowStateModel):
         if ai_provider and snapshot.request.approval_mode == "ai_auto" and snapshot.selected_candidate is not None:
             try:
-                draft = ai_provider.draft_reply(snapshot.selected_candidate)
+                draft = _call_with_optional_context(ai_provider.draft_reply, snapshot.selected_candidate, snapshot.reply_context or None)
                 snapshot.drafting_source = "ai"
                 snapshot.log_event("draft_reply", "ai draft generated", rationale=draft.rationale)
                 return draft.text
             except AIProviderError as exc:
                 snapshot.log_event("draft_reply", "ai draft failed, using fallback", error=str(exc))
         snapshot.drafting_source = "deterministic"
+        brief = snapshot.reply_context.get("reply_brief") if isinstance(snapshot.reply_context, dict) else None
+        if isinstance(brief, dict):
+            acknowledgment = str(brief.get("acknowledgment") or "").strip().rstrip(".")
+            fuller_angle = str(brief.get("fuller_angle") or "").strip().rstrip(".")
+            parts = [part for part in (acknowledgment, fuller_angle) if part]
+            if parts:
+                return ". ".join(parts) + "."
         return snapshot.request.reply_text or "The real win here is how much complexity this strips out."
 
     def draft_post(snapshot: WorkflowStateModel):
@@ -637,6 +843,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             fetch_feed=fetch_feed,
             moderate_candidates=moderate_candidates if getattr(ai_provider, "moderate_candidates", None) is not None else None,
             select_candidate=select_candidate,
+            enrich_reply_context=enrich_reply_context,
             load_repo_context=load_repo_context,
             draft_reply=draft_reply,
             draft_post=draft_post,

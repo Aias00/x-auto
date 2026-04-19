@@ -141,13 +141,53 @@ class TwitterClient:
 
     def fetch_tweet(self, tweet_id: str) -> TweetRecord:
         payload = self._run_json(["tweet", tweet_id]).payload
-        data = payload.get("data")
-        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        tweets = self._parse_tweets(payload)
+        if not tweets:
             raise TwitterClientError(f"No tweet data returned for {tweet_id}")
-        tweet = TweetRecord.from_payload(data[0])
+        tweet = tweets[0]
         if not tweet.tweet_id:
             raise TwitterClientError(f"Invalid tweet payload returned for {tweet_id}")
         return tweet
+
+    def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5) -> tuple[TweetRecord, list[TweetRecord]]:
+        if max_replies < 0:
+            raise ValueError("max_replies must be >= 0")
+        payload = self._run_json(["tweet", tweet_id, "-n", str(max_replies)]).payload
+        tweets = self._parse_tweets(payload)
+        if not tweets:
+            raise TwitterClientError(f"No tweet thread returned for {tweet_id}")
+        return tweets[0], tweets[1:]
+
+    def fetch_user_profile(self, screen_name: str) -> dict[str, object]:
+        payload = self._run_json(["user", screen_name]).payload
+        data = payload.get("data")
+        if isinstance(data, list):
+            record = next((item for item in data if isinstance(item, dict)), None)
+        elif isinstance(data, dict):
+            record = data
+        else:
+            record = None
+        if record is None:
+            raise TwitterClientError(f"No user profile returned for {screen_name}")
+        raw = dict(record)
+        return {
+            "screen_name": str(raw.get("screenName") or raw.get("screen_name") or screen_name),
+            "name": str(raw.get("name")) if raw.get("name") else None,
+            "verified": bool(raw.get("verified")),
+            "description": str(raw.get("description") or raw.get("bio") or "") or None,
+            "followers_count": raw.get("followersCount") or raw.get("followers_count"),
+            "following_count": raw.get("followingCount") or raw.get("following_count"),
+            "raw": raw,
+        }
+
+    def fetch_user_posts(self, screen_name: str, *, max_items: int = 5) -> list[TweetRecord]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        payload = self._run_json(["user-posts", screen_name, "-n", str(max_items), "--full-text"]).payload
+        tweets = self._parse_tweets(payload)
+        if not tweets:
+            raise TwitterClientError(f"No user posts returned for {screen_name}")
+        return tweets
 
     def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
         execution = self._run_json(["reply", tweet_id, text], allow_error_payload=True)
@@ -228,6 +268,13 @@ class TwitterClient:
             error_code=self._extract_error_code(payload),
             error_message=self._extract_error_message(payload),
         )
+
+    def _parse_tweets(self, payload: dict[str, object]) -> list[TweetRecord]:
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return []
+        tweets = [TweetRecord.from_payload(item) for item in data if isinstance(item, dict)]
+        return [tweet for tweet in tweets if tweet.tweet_id]
 
     def _run_json(
         self,

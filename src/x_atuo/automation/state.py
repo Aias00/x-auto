@@ -184,6 +184,7 @@ class WorkflowStateModel(BaseModel):
     selection_source: str | None = None
     selection_reason: str | None = None
     repo_context: RepoContext | None = None
+    reply_context: dict[str, Any] = Field(default_factory=dict)
     rendered_text: str | None = None
     drafting_source: str | None = None
     result: ExecutionResult | None = None
