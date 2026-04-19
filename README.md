@@ -42,13 +42,30 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 
 ## Development
 
+Preferred with `uv`:
+
 ```bash
-cd /Users/aias/workspace/x-atuo
+cd /Users/aias/Work/github/x-auto
+uv sync --extra dev
+uv run pytest -q
+uv run uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
+```
+
+Traditional `venv + pip`:
+
+```bash
+cd /Users/aias/Work/github/x-auto
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
-PYTHONPATH=src uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
+python -m pip install -e ".[dev]"
+python -m pytest -q
+python -m uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
 ```
+
+Notes:
+
+- `uv` is the shortest path because it creates and uses the project virtualenv automatically.
+- If you use the `venv` flow, create the environment with `python3 -m venv .venv` first. Outside an activated virtualenv, bare `python` may point to the macOS system stub.
 
 ## Example Calls
 

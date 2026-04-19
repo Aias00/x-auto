@@ -46,11 +46,24 @@ class AIReplyContextPlan:
     rationale: str
 
 
+@dataclass(slots=True, frozen=True)
+class AIEnhancementDecision:
+    should_enrich: bool
+    reason: str
+
+
 class BaseAIProvider:
     def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
         raise NotImplementedError
 
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
+        raise NotImplementedError
+
+    def decide_reply_enhancement(
+        self,
+        candidate: FeedCandidate,
+        base_reply_text: str,
+    ) -> AIEnhancementDecision:
         raise NotImplementedError
 
     def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
@@ -63,7 +76,7 @@ class BaseAIProvider:
         raise NotImplementedError
 
 
-def _compose_reply_text(acknowledgment: str, fuller_angle: str, *, max_length: int = 140) -> str:
+def compose_reply_text(acknowledgment: str, fuller_angle: str, *, max_length: int = 140) -> str:
     parts = [item.strip().rstrip(".") for item in (acknowledgment, fuller_angle) if item and item.strip()]
     if not parts:
         return "The real win here is how much complexity this strips out."
@@ -103,6 +116,16 @@ class MockAIProvider(BaseAIProvider):
             for candidate in candidates
         ]
 
+    def decide_reply_enhancement(
+        self,
+        candidate: FeedCandidate,
+        base_reply_text: str,
+    ) -> AIEnhancementDecision:
+        return AIEnhancementDecision(
+            should_enrich=False,
+            reason="mock provider keeps the base reply when it is already serviceable",
+        )
+
     def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
         return AIReplyContextPlan(
             needs_live_search=False,
@@ -115,7 +138,7 @@ class MockAIProvider(BaseAIProvider):
     def draft_reply(self, candidate: FeedCandidate, context: dict[str, Any] | None = None) -> AIDraftResult:
         if context and isinstance(context.get("reply_brief"), dict):
             brief = context["reply_brief"]
-            text = _compose_reply_text(
+            text = compose_reply_text(
                 str(brief.get("acknowledgment") or ""),
                 str(brief.get("fuller_angle") or ""),
             )
@@ -227,6 +250,37 @@ class OpenAICompatibleProvider(BaseAIProvider):
             ]
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AIProviderError(f"Could not parse AI moderation response: {content}") from exc
+
+    def decide_reply_enhancement(
+        self,
+        candidate: FeedCandidate,
+        base_reply_text: str,
+    ) -> AIEnhancementDecision:
+        candidate_payload = candidate.model_dump(mode="json")
+        content = self._chat(
+            "Decide whether a base Twitter reply needs deeper enhancement before publishing. "
+            "Only request enhancement when the base reply is too generic, risks missing key context, or likely needs live/current evidence. "
+            "If the base reply is already specific enough, keep it. Return JSON with should_enrich and reason.",
+            json.dumps(
+                {
+                    "candidate": {
+                        "tweet_id": candidate_payload.get("tweet_id"),
+                        "screen_name": candidate_payload.get("screen_name"),
+                        "text": candidate_payload.get("text"),
+                    },
+                    "base_reply_text": base_reply_text,
+                },
+                ensure_ascii=False,
+            ),
+        )
+        try:
+            parsed = self._parse_json_content(content)
+            return AIEnhancementDecision(
+                should_enrich=bool(parsed.get("should_enrich")),
+                reason=str(parsed.get("reason") or ""),
+            )
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise AIProviderError(f"Could not parse AI enhancement decision: {content}") from exc
 
     def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
         content = self._chat(

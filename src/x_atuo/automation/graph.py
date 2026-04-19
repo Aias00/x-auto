@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from dataclasses import dataclass
@@ -15,7 +16,14 @@ from urllib.request import Request, urlopen
 from langgraph.graph import END, StateGraph
 
 from x_atuo.automation.config import AutomationConfig
-from x_atuo.automation.policies import PolicyHooks, evaluate_policy
+from x_atuo.automation.policies import (
+    PolicyHooks,
+    build_dedupe_key,
+    check_cooldown,
+    check_daily_limit,
+    evaluate_policy,
+    merge_decisions,
+)
 from x_atuo.automation.state import (
     AutomationGraphState,
     AutomationRequest,
@@ -29,7 +37,14 @@ from x_atuo.automation.state import (
     WorkflowStateModel,
     make_initial_state,
 )
-from x_atuo.core.ai_client import AIReplyContextPlan, AIModerationResult, AIProviderError, build_ai_provider
+from x_atuo.core.ai_client import (
+    AIEnhancementDecision,
+    AIReplyContextPlan,
+    AIModerationResult,
+    AIProviderError,
+    build_ai_provider,
+    compose_reply_text,
+)
 from x_atuo.core.github_repo_client import fetch_repo_context as fetch_github_repo_context
 from x_atuo.core.github_repo_client import render_repo_post_text
 from x_atuo.core.twitter_client import TwitterClient
@@ -162,21 +177,22 @@ def _compact_reply_context(context: dict[str, Any] | None) -> dict[str, Any] | N
     return compact
 
 
-def _compose_fallback_reply(acknowledgment: str, fuller_angle: str, *, max_length: int = 280) -> str:
-    parts = [item.strip().rstrip(".") for item in (acknowledgment, fuller_angle) if item and item.strip()]
-    if not parts:
-        return ""
-    text = ". ".join(parts) + "."
-    if len(text) <= max_length:
-        return text
-    if len(parts) == 1:
-        return parts[0][: max_length - 1].rstrip() + "…"
-    first = parts[0] + "."
-    if len(first) >= max_length:
-        return first[: max_length - 1].rstrip() + "…"
-    remaining = max_length - len(first) - 2
-    second = parts[1][:remaining].rstrip(" .")
-    return f"{first} {second}…"
+def _compose_fallback_reply_from_tweet(tweet_text: str | None, *, max_length: int = 280) -> str:
+    normalized = re.sub(r"\s+", " ", str(tweet_text or "")).strip()
+    normalized = re.sub(r"https?://\S+", "", normalized).strip()
+    normalized = normalized.rstrip(" .!?")
+    if not normalized:
+        return "The real win here is how much complexity this strips out."
+
+    suffix = " The real test is whether it holds up in production."
+    if len(normalized) + len(suffix) + 1 <= max_length:
+        return f"{normalized}.{suffix}"
+
+    available = max_length - len(suffix)
+    if available <= 1:
+        return suffix[:max_length].rstrip()
+    clipped = normalized[: available - 1].rstrip(" ,.;:") + "…"
+    return f"{clipped}{suffix}"
 
 
 def _call_with_optional_context(method: Callable[..., Any], *args: Any) -> Any:
@@ -194,6 +210,7 @@ class WorkflowAdapters:
     fetch_feed: StateCallable | None = None
     moderate_candidates: StateCallable | None = None
     select_candidate: StateCallable | None = None
+    plan_reply_strategy: StateCallable | None = None
     enrich_reply_context: StateCallable | None = None
     load_repo_context: StateCallable | None = None
     draft_reply: StateCallable | None = None
@@ -227,6 +244,8 @@ class AutomationGraph:
         workflow.add_node("fetch_feed", self.fetch_feed)
         workflow.add_node("moderate_candidates", self.moderate_candidates)
         workflow.add_node("select_candidate", self.select_candidate)
+        workflow.add_node("candidate_policy_guard", self.candidate_policy_guard)
+        workflow.add_node("plan_reply_strategy", self.plan_reply_strategy)
         workflow.add_node("enrich_reply_context", self.enrich_reply_context)
         workflow.add_node("load_repo_context", self.load_repo_context)
         workflow.add_node("draft_text", self.draft_text)
@@ -263,7 +282,32 @@ class AutomationGraph:
                 "finalize": "finalize",
             },
         )
-        workflow.add_edge("select_candidate", "enrich_reply_context")
+        workflow.add_conditional_edges(
+            "select_candidate",
+            self.route_after_selection,
+            {
+                "candidate_policy_guard": "candidate_policy_guard",
+                "finalize": "finalize",
+            },
+        )
+        workflow.add_conditional_edges(
+            "candidate_policy_guard",
+            self.route_after_candidate_policy,
+            {
+                "retry_candidate": "select_candidate",
+                "plan_reply_strategy": "plan_reply_strategy",
+                "blocked": "blocked",
+            },
+        )
+        workflow.add_conditional_edges(
+            "plan_reply_strategy",
+            self.route_after_reply_strategy,
+            {
+                "enrich_reply_context": "enrich_reply_context",
+                "draft_text": "draft_text",
+                "blocked": "blocked",
+            },
+        )
         workflow.add_edge("enrich_reply_context", "draft_text")
         workflow.add_edge("load_repo_context", "draft_text")
         workflow.add_edge("draft_text", "policy_guard")
@@ -411,15 +455,93 @@ class AutomationGraph:
             )
         return {"snapshot": snapshot}
 
-    async def enrich_reply_context(self, state: AutomationGraphState) -> AutomationGraphState:
+    def route_after_selection(self, state: AutomationGraphState) -> str:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
+            return "finalize"
+        return "candidate_policy_guard"
+
+    async def candidate_policy_guard(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
         if snapshot.status is RunStatus.FAILED:
             return {"snapshot": snapshot}
         if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE or snapshot.selected_candidate is None:
             return {"snapshot": snapshot}
-        if self.adapters.enrich_reply_context is None:
+
+        snapshot.policy = self._evaluate_candidate_policy(snapshot)
+        snapshot.log_event(
+            "candidate_policy_guard",
+            "candidate policy evaluated",
+            allowed=snapshot.policy.allowed,
+            reasons=snapshot.policy.reasons,
+            dedupe_key=snapshot.policy.dedupe_key,
+        )
+        if not snapshot.policy.allowed:
+            if not self._retry_blocked_candidate(snapshot, node="candidate_policy_guard"):
+                snapshot.mark_blocked(snapshot.policy.reasons, node="candidate_policy_guard")
+        return {"snapshot": snapshot}
+
+    def route_after_candidate_policy(self, state: AutomationGraphState) -> str:
+        snapshot = state["snapshot"]
+        if snapshot.status in {RunStatus.BLOCKED, RunStatus.FAILED}:
+            return "blocked"
+        if snapshot.request.workflow is WorkflowKind.FEED_ENGAGE and snapshot.selected_candidate is None:
+            return "retry_candidate"
+        return "plan_reply_strategy"
+
+    async def plan_reply_strategy(self, state: AutomationGraphState) -> AutomationGraphState:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
             return {"snapshot": snapshot}
-        snapshot.reply_context = await maybe_await(self.adapters.enrich_reply_context(snapshot)) or {}
+        if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE or snapshot.selected_candidate is None:
+            return {"snapshot": snapshot}
+        if snapshot.request.reply_text:
+            snapshot.reply_context = {}
+            return {"snapshot": snapshot}
+
+        reply_context = dict(snapshot.reply_context) if isinstance(snapshot.reply_context, dict) else {}
+        reply_context["should_enrich"] = False
+        reply_context["enhancement_reason"] = "base reply is the default path"
+
+        if self.adapters.plan_reply_strategy is not None:
+            try:
+                decision = await maybe_await(self.adapters.plan_reply_strategy(snapshot))
+                reply_context["should_enrich"] = bool(getattr(decision, "should_enrich", False))
+                reply_context["enhancement_reason"] = str(getattr(decision, "reason", "") or "")
+            except AIProviderError as exc:
+                snapshot.log_event("plan_reply_strategy", "enhancement decision failed", error=str(exc))
+
+        reply_context["base_reply_text"] = _compose_fallback_reply_from_tweet(
+            snapshot.selected_candidate.text if snapshot.selected_candidate is not None else None,
+            max_length=self.config.policies.max_reply_length,
+        )
+
+        snapshot.reply_context = reply_context
+        snapshot.log_event(
+            "plan_reply_strategy",
+            "reply strategy planned",
+            should_enrich=bool(reply_context.get("should_enrich")),
+            reason=reply_context.get("enhancement_reason"),
+        )
+        return {"snapshot": snapshot}
+
+    def route_after_reply_strategy(self, state: AutomationGraphState) -> str:
+        snapshot = state["snapshot"]
+        if snapshot.status in {RunStatus.BLOCKED, RunStatus.FAILED}:
+            return "blocked"
+        if self._should_enrich_reply_context(snapshot):
+            return "enrich_reply_context"
+        return "draft_text"
+
+    async def enrich_reply_context(self, state: AutomationGraphState) -> AutomationGraphState:
+        snapshot = state["snapshot"]
+        if snapshot.status is RunStatus.FAILED:
+            return {"snapshot": snapshot}
+        if not self._should_enrich_reply_context(snapshot):
+            return {"snapshot": snapshot}
+        existing = dict(snapshot.reply_context) if isinstance(snapshot.reply_context, dict) else {}
+        enriched = await maybe_await(self.adapters.enrich_reply_context(snapshot)) or {}
+        snapshot.reply_context = {**existing, **enriched}
         if snapshot.reply_context:
             snapshot.log_event(
                 "enrich_reply_context",
@@ -506,7 +628,53 @@ class AutomationGraph:
             return "retry_candidate"
         return "execute"
 
-    def _retry_blocked_candidate(self, snapshot: WorkflowStateModel) -> bool:
+    def _should_enrich_reply_context(self, snapshot: WorkflowStateModel) -> bool:
+        if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE:
+            return False
+        if snapshot.selected_candidate is None or self.adapters.enrich_reply_context is None:
+            return False
+        return bool(snapshot.reply_context.get("should_enrich"))
+
+    def _evaluate_candidate_policy(self, snapshot: WorkflowStateModel) -> PolicyDecision:
+        candidate = snapshot.selected_candidate
+        hooks = self.adapters.policy_hooks
+        if candidate is None:
+            return PolicyDecision()
+
+        decisions: list[PolicyDecision] = []
+
+        dedupe = PolicyDecision()
+        if self.config.policies.enforce_dedupe and hooks:
+            if hooks.has_target_tweet_id(candidate.tweet_id):
+                dedupe.allowed = False
+                dedupe.reasons.append("target tweet already engaged")
+            elif snapshot.request.reply_text:
+                dedupe_key = build_dedupe_key(
+                    snapshot.request,
+                    candidate=candidate,
+                    text=snapshot.request.reply_text,
+                )
+                dedupe.dedupe_key = dedupe_key
+                if hooks.has_dedupe_key(dedupe_key):
+                    dedupe.allowed = False
+                    dedupe.reasons.append("duplicate execution detected")
+        decisions.append(dedupe)
+
+        if hooks:
+            count = hooks.get_daily_execution_count(snapshot.request.workflow, datetime.now(UTC).date())
+            decisions.append(check_daily_limit(count=count, limit=self.config.policies.daily_execution_limit))
+            if candidate.screen_name:
+                last_author_at = hooks.get_last_author_engagement(candidate.screen_name)
+                decisions.append(
+                    check_cooldown(
+                        last_seen_at=last_author_at,
+                        cooldown_minutes=self.config.policies.per_author_cooldown_minutes,
+                    )
+                )
+
+        return merge_decisions(*decisions)
+
+    def _retry_blocked_candidate(self, snapshot: WorkflowStateModel, *, node: str = "policy_guard") -> bool:
         if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE:
             return False
         if snapshot.selected_candidate is None or not snapshot.policy.reasons:
@@ -535,11 +703,12 @@ class AutomationGraph:
         snapshot.selected_candidate = None
         snapshot.selection_source = None
         snapshot.selection_reason = None
+        snapshot.reply_context = {}
         snapshot.rendered_text = None
         snapshot.drafting_source = None
         snapshot.policy = PolicyDecision()
         snapshot.log_event(
-            "policy_guard",
+            node,
             "candidate blocked, trying next",
             tweet_id=blocked_candidate.tweet_id,
             screen_name=blocked_candidate.screen_name,
@@ -606,36 +775,56 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         raw = fetch_repo_context(snapshot.request.repo_url or "")
         return RepoContext(**raw)
 
+    def build_hydrated_metadata(candidate: FeedCandidate, tweet: TweetRecord) -> dict[str, Any]:
+        raw = dict(tweet.raw) if isinstance(tweet.raw, dict) else {}
+        author = raw.get("author")
+        if not isinstance(author, dict):
+            raw["author"] = {
+                "screenName": tweet.screen_name or candidate.screen_name or "",
+                "verified": tweet.verified,
+            }
+        raw["_x_atuo_hydrated"] = True
+        return raw
+
+    def hydrate_selected_candidate(candidate: FeedCandidate | None) -> FeedCandidate | None:
+        if candidate is None:
+            return None
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        if metadata.get("_x_atuo_hydrated"):
+            return candidate
+        fetch_tweet = getattr(service.client, "fetch_tweet", None)
+        if fetch_tweet is None:
+            return candidate
+        try:
+            tweet = fetch_tweet(candidate.tweet_id)
+        except Exception:
+            return candidate
+        candidate.screen_name = tweet.screen_name or candidate.screen_name
+        candidate.text = tweet.text or candidate.text
+        candidate.author_verified = tweet.verified
+        candidate.metadata = build_hydrated_metadata(candidate, tweet)
+        return candidate
+
     def enrich_reply_context(snapshot: WorkflowStateModel):
         candidate = snapshot.selected_candidate
         if candidate is None or snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE:
             return {}
 
         replies: list[TweetRecord] = []
-        main_tweet: TweetRecord | None = None
-        fetch_thread = getattr(service.client, "fetch_tweet_thread", None)
-        if fetch_thread is not None:
-            try:
-                main_tweet, replies = fetch_thread(candidate.tweet_id, max_replies=5)
-            except Exception as exc:
-                snapshot.log_event("enrich_reply_context", "tweet thread unavailable", error=str(exc))
-                main_tweet = None
-                replies = []
-        if main_tweet is None:
-            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
-            if metadata.get("id") and metadata.get("author"):
-                main_tweet = TweetRecord.from_payload(metadata)
-            else:
-                main_tweet = TweetRecord.from_payload(
-                    {
-                        "id": candidate.tweet_id,
-                        "text": candidate.text or "",
-                        "author": {
-                            "screenName": candidate.screen_name or "",
-                            "verified": bool(candidate.author_verified),
-                        },
-                    }
-                )
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        if metadata.get("id") and metadata.get("author"):
+            main_tweet = TweetRecord.from_payload(metadata)
+        else:
+            main_tweet = TweetRecord.from_payload(
+                {
+                    "id": candidate.tweet_id,
+                    "text": candidate.text or "",
+                    "author": {
+                        "screenName": candidate.screen_name or "",
+                        "verified": bool(candidate.author_verified),
+                    },
+                }
+            )
 
         candidate.screen_name = main_tweet.screen_name or candidate.screen_name
         candidate.text = main_tweet.text or candidate.text
@@ -703,12 +892,41 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         return context
 
     def draft_reply(snapshot: WorkflowStateModel):
+        candidate = snapshot.selected_candidate
+        reply_context = snapshot.reply_context if isinstance(snapshot.reply_context, dict) else {}
+        brief = reply_context.get("reply_brief") if isinstance(reply_context.get("reply_brief"), dict) else None
+        fallback_text = str(reply_context.get("base_reply_text") or "")
+        if not fallback_text:
+            fallback_text = _compose_fallback_reply_from_tweet(
+                candidate.text if candidate is not None else None,
+                max_length=config.policies.max_reply_length,
+            )
+        if not bool(reply_context.get("should_enrich")):
+            snapshot.drafting_source = "deterministic"
+            snapshot.log_event(
+                "draft_reply",
+                "base reply used without enhancement",
+                rationale=str(reply_context.get("enhancement_reason") or ""),
+            )
+            return fallback_text
+        if isinstance(brief, dict) and not (reply_context.get("knowledge_evidence") or []):
+            snapshot.drafting_source = "ai"
+            snapshot.log_event(
+                "draft_reply",
+                "enhanced reply composed from reply brief",
+                rationale=str(brief.get("rationale") or ""),
+            )
+            return compose_reply_text(
+                str(brief.get("acknowledgment") or ""),
+                str(brief.get("fuller_angle") or ""),
+                max_length=config.policies.max_reply_length,
+            )
         if ai_provider and snapshot.request.approval_mode == "ai_auto" and snapshot.selected_candidate is not None:
             try:
                 draft = _call_with_optional_context(
                     ai_provider.draft_reply,
                     snapshot.selected_candidate,
-                    _compact_reply_context(snapshot.reply_context),
+                    _compact_reply_context(reply_context),
                 )
                 snapshot.drafting_source = "ai"
                 snapshot.log_event("draft_reply", "ai draft generated", rationale=draft.rationale)
@@ -716,14 +934,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             except AIProviderError as exc:
                 snapshot.log_event("draft_reply", "ai draft failed, using fallback", error=str(exc))
         snapshot.drafting_source = "deterministic"
-        brief = snapshot.reply_context.get("reply_brief") if isinstance(snapshot.reply_context, dict) else None
-        if isinstance(brief, dict):
-            acknowledgment = str(brief.get("acknowledgment") or "").strip().rstrip(".")
-            fuller_angle = str(brief.get("fuller_angle") or "").strip().rstrip(".")
-            clipped = _compose_fallback_reply(acknowledgment, fuller_angle)
-            if clipped:
-                return clipped
-        return snapshot.request.reply_text or "The real win here is how much complexity this strips out."
+        return snapshot.request.reply_text or fallback_text
 
     def draft_post(snapshot: WorkflowStateModel):
         if snapshot.request.post_text:
@@ -774,17 +985,40 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         snapshot.selection_source = "deterministic"
         return snapshot.candidates[0] if snapshot.candidates else None
 
-    def moderate_candidates(snapshot: WorkflowStateModel):
+    def plan_reply_strategy(snapshot: WorkflowStateModel):
+        if snapshot.selected_candidate is not None:
+            hydrate_selected_candidate(snapshot.selected_candidate)
+        if snapshot.request.approval_mode != "ai_auto":
+            return AIEnhancementDecision(should_enrich=False, reason="deterministic mode skips enhancement")
+        if ai_provider is None or snapshot.selected_candidate is None:
+            return AIEnhancementDecision(should_enrich=False, reason="no ai provider")
+        decider = getattr(ai_provider, "decide_reply_enhancement", None)
+        if decider is None:
+            return AIEnhancementDecision(should_enrich=True, reason="provider does not expose lightweight gate")
+        base_reply_text = _compose_fallback_reply_from_tweet(
+            snapshot.selected_candidate.text,
+            max_length=config.policies.max_reply_length,
+        )
+        return _call_with_optional_context(decider, snapshot.selected_candidate, base_reply_text)
+
+    async def moderate_candidates(snapshot: WorkflowStateModel):
         if ai_provider is None or not snapshot.candidates:
             return []
         moderate = getattr(ai_provider, "moderate_candidates", None)
         if moderate is None:
             return []
         fetch_failures: list[AIModerationResult] = []
-        for candidate in snapshot.candidates:
+
+        async def hydrate_candidate(candidate: FeedCandidate) -> tuple[FeedCandidate, TweetRecord | None, Exception | None]:
             try:
-                tweet = service.client.fetch_tweet(candidate.tweet_id)
+                tweet = await asyncio.to_thread(service.client.fetch_tweet, candidate.tweet_id)
+                return candidate, tweet, None
             except Exception as exc:
+                return candidate, None, exc
+
+        hydrated = await asyncio.gather(*(hydrate_candidate(candidate) for candidate in snapshot.candidates))
+        for candidate, tweet, exc in hydrated:
+            if exc is not None:
                 fetch_failures.append(
                     AIModerationResult(
                         tweet_id=candidate.tweet_id,
@@ -794,10 +1028,12 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                     )
                 )
                 continue
+            if tweet is None:
+                continue
             candidate.screen_name = tweet.screen_name or candidate.screen_name
             candidate.text = tweet.text or candidate.text
             candidate.author_verified = tweet.verified
-            candidate.metadata = tweet.raw
+            candidate.metadata = build_hydrated_metadata(candidate, tweet)
         return [*moderate(snapshot.candidates), *fetch_failures]
 
     def execute_engage(snapshot: WorkflowStateModel):
@@ -902,6 +1138,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             fetch_feed=fetch_feed,
             moderate_candidates=moderate_candidates if getattr(ai_provider, "moderate_candidates", None) is not None else None,
             select_candidate=select_candidate,
+            plan_reply_strategy=plan_reply_strategy,
             enrich_reply_context=enrich_reply_context,
             load_repo_context=load_repo_context,
             draft_reply=draft_reply,
