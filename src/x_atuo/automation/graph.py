@@ -124,6 +124,61 @@ def _summarize_replies(replies: list[TweetRecord]) -> str:
     return " | ".join(lines)
 
 
+def _summarize_author_pattern(posts: list[dict[str, Any]]) -> str | None:
+    snippets = [str(post.get("text") or "").strip() for post in posts if str(post.get("text") or "").strip()]
+    if not snippets:
+        return None
+    summary = " ".join(snippets[:3])
+    return summary[:280].strip()
+
+
+def _compact_reply_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(context, dict) or not context:
+        return context
+
+    target_post = context.get("target_post") if isinstance(context.get("target_post"), dict) else {}
+    author_profile = context.get("author_profile") if isinstance(context.get("author_profile"), dict) else {}
+    reply_brief = context.get("reply_brief") if isinstance(context.get("reply_brief"), dict) else {}
+    evidence = context.get("knowledge_evidence") if isinstance(context.get("knowledge_evidence"), list) else []
+    compact: dict[str, Any] = {
+        "target_text": str(target_post.get("text") or "")[:400],
+        "author_profile_compact": {
+            "screen_name": author_profile.get("screen_name"),
+            "name": author_profile.get("name"),
+            "verified": author_profile.get("verified"),
+            "description": author_profile.get("description"),
+        },
+        "author_pattern": _summarize_author_pattern(
+            context.get("author_recent_posts") if isinstance(context.get("author_recent_posts"), list) else []
+        ),
+        "existing_replies_summary": str(context.get("existing_replies_summary") or "")[:280],
+        "knowledge_evidence_top1": evidence[0] if evidence else None,
+        "reply_brief": {
+            "acknowledgment": reply_brief.get("acknowledgment"),
+            "fuller_angle": reply_brief.get("fuller_angle"),
+            "rationale": reply_brief.get("rationale"),
+        },
+    }
+    return compact
+
+
+def _compose_fallback_reply(acknowledgment: str, fuller_angle: str, *, max_length: int = 280) -> str:
+    parts = [item.strip().rstrip(".") for item in (acknowledgment, fuller_angle) if item and item.strip()]
+    if not parts:
+        return ""
+    text = ". ".join(parts) + "."
+    if len(text) <= max_length:
+        return text
+    if len(parts) == 1:
+        return parts[0][: max_length - 1].rstrip() + "…"
+    first = parts[0] + "."
+    if len(first) >= max_length:
+        return first[: max_length - 1].rstrip() + "…"
+    remaining = max_length - len(first) - 2
+    second = parts[1][:remaining].rstrip(" .")
+    return f"{first} {second}…"
+
+
 def _call_with_optional_context(method: Callable[..., Any], *args: Any) -> Any:
     try:
         params = inspect.signature(method).parameters
@@ -650,7 +705,11 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
     def draft_reply(snapshot: WorkflowStateModel):
         if ai_provider and snapshot.request.approval_mode == "ai_auto" and snapshot.selected_candidate is not None:
             try:
-                draft = _call_with_optional_context(ai_provider.draft_reply, snapshot.selected_candidate, snapshot.reply_context or None)
+                draft = _call_with_optional_context(
+                    ai_provider.draft_reply,
+                    snapshot.selected_candidate,
+                    _compact_reply_context(snapshot.reply_context),
+                )
                 snapshot.drafting_source = "ai"
                 snapshot.log_event("draft_reply", "ai draft generated", rationale=draft.rationale)
                 return draft.text
@@ -661,9 +720,9 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         if isinstance(brief, dict):
             acknowledgment = str(brief.get("acknowledgment") or "").strip().rstrip(".")
             fuller_angle = str(brief.get("fuller_angle") or "").strip().rstrip(".")
-            parts = [part for part in (acknowledgment, fuller_angle) if part]
-            if parts:
-                return ". ".join(parts) + "."
+            clipped = _compose_fallback_reply(acknowledgment, fuller_angle)
+            if clipped:
+                return clipped
         return snapshot.request.reply_text or "The real win here is how much complexity this strips out."
 
     def draft_post(snapshot: WorkflowStateModel):

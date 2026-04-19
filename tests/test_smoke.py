@@ -19,6 +19,7 @@ from x_atuo.automation.state import AutomationRequest
 from x_atuo.automation.state import WorkflowKind
 from x_atuo.automation.storage import AutomationStorage
 import x_atuo.automation.api as automation_api
+from x_atuo.core.ai_client import AIProviderError
 from x_atuo.core.ai_client import OpenAICompatibleProvider
 
 
@@ -1724,7 +1725,7 @@ def test_feed_engage_uses_live_search_when_context_plan_requests_it(monkeypatch,
 
         def draft_reply(self, candidate, context=None):
             assert context is not None
-            assert context["knowledge_evidence"][0]["snippet"] == "Grok can search X and the web in real time."
+            assert context["knowledge_evidence_top1"]["snippet"] == "Grok can search X and the web in real time."
             return type(
                 "Draft",
                 (),
@@ -1756,3 +1757,213 @@ def test_feed_engage_uses_live_search_when_context_plan_requests_it(monkeypatch,
     body = response.json()
     assert body["status"] == "completed"
     assert body["result"]["rendered_text"].startswith("December 2025 already sounds pretty fresh.")
+
+
+def test_feed_engage_draft_reply_receives_compact_context(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified, "name": "Builder"},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified, "name": "Builder"})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder", "A context-heavy technical post")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder", "A context-heavy technical post")
+
+        def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5):
+            return (
+                FakeTweet(tweet_id, "builder", "A context-heavy technical post"),
+                [
+                    FakeTweet("r1", "alice", "This is about retrieval defaults."),
+                    FakeTweet("r2", "bob", "The real risk is silent fallback."),
+                ],
+            )
+
+        def fetch_user_profile(self, screen_name: str):
+            return {
+                "screen_name": screen_name,
+                "name": "Builder",
+                "verified": True,
+                "description": "Builds agent systems",
+                "raw": {"too": "large"},
+            }
+
+        def fetch_user_posts(self, screen_name: str, *, max_items: int = 5):
+            return [
+                FakeTweet("h1", screen_name, "Most failures come from orchestration, not the model."),
+                FakeTweet("h2", screen_name, "Latency compounds across tool calls."),
+                FakeTweet("h3", screen_name, "Retrieval defaults matter more than flashy demos."),
+                FakeTweet("h4", screen_name, "Fallback paths need to be visible to operators."),
+                FakeTweet("h5", screen_name, "Shipping UX beats benchmark wins."),
+            ]
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": True, "category": None, "reason": "technical"})()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type("Selection", (), {"tweet_id": "111", "reason": "good candidate"})()
+
+        def plan_reply_context(self, candidate, context):
+            return type(
+                "Plan",
+                (),
+                {
+                    "needs_live_search": True,
+                    "search_query": "agent orchestration retrieval defaults",
+                    "acknowledgment": "That framing makes sense.",
+                    "fuller_angle": "The real failure mode is when retrieval quietly becomes optional.",
+                    "rationale": "compress before draft",
+                },
+            )()
+
+        def draft_reply(self, candidate, context=None):
+            assert context is not None
+            assert context["target_text"] == "A context-heavy technical post"
+            assert context["author_profile_compact"] == {
+                "screen_name": "builder",
+                "name": "Builder",
+                "verified": True,
+                "description": "Builds agent systems",
+            }
+            assert context["author_pattern"]
+            assert context["existing_replies_summary"] == "@alice: This is about retrieval defaults. | @bob: The real risk is silent fallback."
+            assert context["knowledge_evidence_top1"]["snippet"] == "Top evidence snippet"
+            assert context["reply_brief"]["acknowledgment"] == "That framing makes sense."
+            assert "author_recent_posts" not in context
+            assert "existing_replies" not in context
+            assert "knowledge_evidence" not in context
+            return type(
+                "Draft",
+                (),
+                {
+                    "text": "That framing makes sense. The real failure mode is when retrieval quietly becomes optional.",
+                    "rationale": "compact context used",
+                },
+            )()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setattr(
+        "x_atuo.automation.graph.search_web_context",
+        lambda query, max_results=3: [{"title": "Evidence", "snippet": "Top evidence snippet", "url": "https://example.com/evidence"}],
+        raising=False,
+    )
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "reply-compact-context.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+
+
+def test_feed_engage_clips_fallback_reply_to_280_chars(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified, "name": "Builder"},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified, "name": "Builder"})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder", "Long-form technical setup question")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder", "Long-form technical setup question")
+
+        def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5):
+            return (FakeTweet(tweet_id, "builder", "Long-form technical setup question"), [])
+
+        def fetch_user_profile(self, screen_name: str):
+            return {"screen_name": screen_name, "name": "Builder", "verified": True, "description": "Builds agent systems"}
+
+        def fetch_user_posts(self, screen_name: str, *, max_items: int = 5):
+            return [FakeTweet("h1", screen_name, "History post")]
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": True, "category": None, "reason": "technical"})()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type("Selection", (), {"tweet_id": "111", "reason": "good candidate"})()
+
+        def plan_reply_context(self, candidate, context):
+            return type(
+                "Plan",
+                (),
+                {
+                    "needs_live_search": False,
+                    "search_query": None,
+                    "acknowledgment": "A" * 220,
+                    "fuller_angle": "B" * 220,
+                    "rationale": "long fallback brief",
+                },
+            )()
+
+        def draft_reply(self, candidate, context=None):
+            raise AIProviderError("AI request failed: The read operation timed out")
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "reply-fallback-clip.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert len(body["result"]["rendered_text"]) <= 280
