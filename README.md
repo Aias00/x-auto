@@ -23,8 +23,9 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 - Twitter execution reads credentials from `~/.agent-reach/config.yaml`
 - If `twitter_auth_token` / `twitter_ct0` are absent there, it falls back to `TWITTER_AUTH_TOKEN` and `TWITTER_CT0`
 - Proxy can be passed per request, or defaulted in automation config
-- `feed-engage` runs AI candidate moderation before selection when an AI provider is configured; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out
-- `feed-engage` enriches candidates with full tweet text before moderation, selection, and reply drafting
+- `feed-engage` runs AI candidate moderation on feed previews before selection when an AI provider is configured; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out
+- `feed-engage` trims the candidate pool to a newest-first shortlist, hydrates that shortlist with full tweet text, then runs AI selection and a final single-candidate full-text review before drafting
+- hydrated shortlist candidates are cached in SQLite and reused across runs before refetching feed; cached candidates are leased to a single run at a time and expire automatically
 - scheduled `feed-engage` runs are queued behind a single in-process worker with a bounded backlog; when the backlog is full, new scheduled requests are recorded as blocked runs instead of silently disappearing
 - `repo-post` uses deterministic GitHub fetching, but can use AI drafting in `ai_auto` mode when an AI provider is configured
 - AI drafting/selection is optional
@@ -45,27 +46,33 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 Preferred with `uv`:
 
 ```bash
-cd /Users/aias/Work/github/x-auto
+cd /Users/aias/workspace/x-atuo
 uv sync --extra dev
 uv run pytest -q
-uv run uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
+PYTHONPATH=src uv run uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
 ```
 
 Traditional `venv + pip`:
 
 ```bash
-cd /Users/aias/Work/github/x-auto
+cd /Users/aias/workspace/x-atuo
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
 python -m pytest -q
-python -m uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
+PYTHONPATH=src python -m uvicorn x_atuo.automation.api:app --host 0.0.0.0 --port 18000 --reload
 ```
 
 Notes:
 
 - `uv` is the shortest path because it creates and uses the project virtualenv automatically.
 - If you use the `venv` flow, create the environment with `python3 -m venv .venv` first. Outside an activated virtualenv, bare `python` may point to the macOS system stub.
+- Candidate-pool tuning lives under `X_ATUO_POLICIES__*`:
+  - `CANDIDATE_REFRESH_ROUNDS`: how many times `feed-engage` may refetch when the pool empties
+  - `CANDIDATE_HYDRATION_COUNT`: shortlist size to hydrate with full tweet text before selection
+  - `CANDIDATE_CACHE_PENDING_TTL_MINUTES`: how long pending hydrated shortlist entries stay reusable
+  - `CANDIDATE_CACHE_REJECTED_TTL_MINUTES`: how long rejected shortlist entries are retained for diagnostics
+  - `CANDIDATE_CACHE_CLAIM_TTL_MINUTES`: how long a run leases claimed shortlist entries before they return to `pending`
 
 ## Example Calls
 

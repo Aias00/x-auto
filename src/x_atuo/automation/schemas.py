@@ -25,7 +25,7 @@ class BaseWebhookRequest(StrictModel):
 
 
 class FeedEngageRequest(BaseWebhookRequest):
-    feed_count: int = Field(default=5, ge=1, le=100)
+    feed_count: int = Field(default=10, ge=1, le=100)
     feed_type: FeedType = "for-you"
     reply_template: str | None = None
 

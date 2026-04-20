@@ -41,6 +41,7 @@ class FeedCandidate(BaseModel):
     tweet_id: str
     screen_name: str | None = None
     text: str | None = None
+    created_at: datetime | None = None
     url: str | None = None
     author_verified: bool | None = None
     score: float | None = None
@@ -179,6 +180,9 @@ class WorkflowStateModel(BaseModel):
     request: AutomationRequest
     status: RunStatus = RunStatus.PENDING
     policy: PolicyDecision = Field(default_factory=PolicyDecision)
+    candidate_refresh_count: int = 0
+    candidate_refresh_pending: bool = False
+    candidate_cache_persisted: bool = False
     candidates: list[FeedCandidate] = Field(default_factory=list)
     selected_candidate: FeedCandidate | None = None
     selection_source: str | None = None
@@ -188,6 +192,8 @@ class WorkflowStateModel(BaseModel):
     rendered_text: str | None = None
     drafting_source: str | None = None
     result: ExecutionResult | None = None
+    execution_attempt_history: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_observability: dict[str, dict[str, Any]] = Field(default_factory=dict, exclude=True)
     errors: list[str] = Field(default_factory=list)
     events: list[StateEvent] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=utc_now)
@@ -195,6 +201,13 @@ class WorkflowStateModel(BaseModel):
 
     def touch(self) -> None:
         self.updated_at = utc_now()
+
+    def stash_runtime_observability(self, key: str, **payload: Any) -> None:
+        self.runtime_observability[key] = payload
+
+    def pop_runtime_observability(self, key: str) -> dict[str, Any]:
+        value = self.runtime_observability.pop(key, {})
+        return value if isinstance(value, dict) else {}
 
     def log_event(self, node: str, message: str, **payload: Any) -> None:
         self.events.append(StateEvent(node=node, message=message, payload=payload))
@@ -210,11 +223,11 @@ class WorkflowStateModel(BaseModel):
         self.errors.extend(reasons)
         self.log_event(node, "policy blocked execution", reasons=reasons)
 
-    def mark_completed(self, result: ExecutionResult, *, node: str = "execute") -> None:
+    def mark_completed(self, result: ExecutionResult, *, node: str = "execute", **payload: Any) -> None:
         self.result = result
         self.status = RunStatus.COMPLETED if result.ok else RunStatus.FAILED
         message = "execution completed" if result.ok else "execution failed"
-        self.log_event(node, message, result=result.model_dump(mode="json"))
+        self.log_event(node, message, result=result.model_dump(mode="json"), **payload)
 
 
 class AutomationGraphState(TypedDict):

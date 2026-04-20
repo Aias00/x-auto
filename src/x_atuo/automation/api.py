@@ -204,6 +204,7 @@ async def lifespan(app: FastAPI):
     settings = AutomationConfig()
     storage = AutomationStorage(_resolve_db_path())
     storage.initialize()
+    storage.clear_stale_running_runs(reason="stale running cleared on service startup")
     app.state.storage = storage
     app.state.settings = settings
 

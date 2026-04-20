@@ -17,7 +17,7 @@ class TwitterRuntimeConfig(BaseModel):
     auth_token_env: str = "TWITTER_AUTH_TOKEN"
     ct0_env: str = "TWITTER_CT0"
     default_feed_type: Literal["following", "for-you"] = "for-you"
-    default_feed_count: int = 5
+    default_feed_count: int = 10
 
 
 class AISettings(BaseModel):
@@ -35,6 +35,11 @@ class PolicyConfig(BaseModel):
 
     max_post_length: int = 280
     max_reply_length: int = 280
+    candidate_refresh_rounds: int = 2
+    candidate_hydration_count: int = 3
+    candidate_cache_pending_ttl_minutes: int = 60
+    candidate_cache_rejected_ttl_minutes: int = 1440
+    candidate_cache_claim_ttl_minutes: int = 10
     enforce_dedupe: bool = True
     daily_execution_limit: int | None = None
     per_author_cooldown_minutes: int | None = None

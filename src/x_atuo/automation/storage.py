@@ -103,6 +103,25 @@ class AutomationStorage:
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS candidate_cache (
+                    workflow TEXT NOT NULL,
+                    tweet_id TEXT NOT NULL,
+                    screen_name TEXT,
+                    created_at TEXT,
+                    text TEXT,
+                    metadata_json TEXT,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    source_run_id TEXT,
+                    claim_run_id TEXT,
+                    claim_expires_at TEXT,
+                    hydrated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_ts TEXT NOT NULL,
+                    updated_ts TEXT NOT NULL,
+                    PRIMARY KEY (workflow, tweet_id)
+                );
+
                 """
             )
             columns = {
@@ -113,6 +132,35 @@ class AutomationStorage:
                 connection.execute("ALTER TABLE engagements ADD COLUMN target_tweet_url TEXT")
             if "reply_url" not in columns:
                 connection.execute("ALTER TABLE engagements ADD COLUMN reply_url TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidate_cache_workflow_status_expires ON candidate_cache(workflow, status, expires_at)"
+            )
+            cache_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(candidate_cache)").fetchall()
+            }
+            if "claim_run_id" not in cache_columns:
+                connection.execute("ALTER TABLE candidate_cache ADD COLUMN claim_run_id TEXT")
+            if "claim_expires_at" not in cache_columns:
+                connection.execute("ALTER TABLE candidate_cache ADD COLUMN claim_expires_at TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidate_cache_source_run_id ON candidate_cache(source_run_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidate_cache_claim_run_id ON candidate_cache(claim_run_id)"
+            )
+
+    @staticmethod
+    def _release_expired_candidate_claims(connection: sqlite3.Connection, *, now: str) -> int:
+        cursor = connection.execute(
+            """
+            UPDATE candidate_cache
+            SET status = 'pending', claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+            WHERE status = 'claimed' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ? AND expires_at > ?
+            """,
+            (now, now, now),
+        )
+        return int(cursor.rowcount or 0)
 
     def healthcheck(self) -> dict[str, Any]:
         with self.connect() as connection:
@@ -221,6 +269,212 @@ class AutomationStorage:
                 (run_id, level, event_type, node, _serialize_json(payload), utcnow()),
             )
             return int(cursor.lastrowid)
+
+    def clear_stale_running_runs(self, *, reason: str) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM runs
+                WHERE status = 'running'
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+
+        cleared: list[str] = []
+        for row in rows:
+            run_id = str(row["id"])
+            self.update_run(
+                run_id,
+                status="failed",
+                error=reason,
+                finished_at=utcnow(),
+            )
+            self.add_audit_event(
+                run_id=run_id,
+                event_type="stale_running_cleared",
+                node="service",
+                payload={"reason": reason},
+            )
+            cleared.append(run_id)
+        return cleared
+
+    def cleanup_candidate_cache(self) -> int:
+        now = utcnow()
+        with self.connect() as connection:
+            released = self._release_expired_candidate_claims(connection, now=now)
+            cursor = connection.execute(
+                """
+                DELETE FROM candidate_cache
+                WHERE expires_at <= ?
+                """,
+                (now,),
+            )
+            return released + int(cursor.rowcount or 0)
+
+    def upsert_candidate_cache_entries(
+        self,
+        *,
+        workflow: str,
+        source_run_id: str,
+        candidates: list[dict[str, Any]],
+        expires_at: str,
+    ) -> None:
+        now = utcnow()
+        with self.connect() as connection:
+            for candidate in candidates:
+                metadata = dict(candidate.get("metadata") or {})
+                metadata["_x_atuo_candidate_cache"] = True
+                connection.execute(
+                    """
+                    INSERT INTO candidate_cache (
+                        workflow, tweet_id, screen_name, created_at, text, metadata_json,
+                        status, reason, source_run_id, claim_run_id, claim_expires_at,
+                        hydrated_at, expires_at, created_ts, updated_ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NULL, ?, NULL, NULL, ?, ?, ?, ?)
+                    ON CONFLICT(workflow, tweet_id) DO UPDATE SET
+                        screen_name = excluded.screen_name,
+                        created_at = excluded.created_at,
+                        text = excluded.text,
+                        metadata_json = excluded.metadata_json,
+                        status = 'pending',
+                        reason = NULL,
+                        source_run_id = excluded.source_run_id,
+                        claim_run_id = NULL,
+                        claim_expires_at = NULL,
+                        hydrated_at = excluded.hydrated_at,
+                        expires_at = excluded.expires_at,
+                        updated_ts = excluded.updated_ts
+                    """,
+                    (
+                        workflow,
+                        str(candidate.get("tweet_id") or ""),
+                        candidate.get("screen_name"),
+                        candidate.get("created_at"),
+                        candidate.get("text"),
+                        _serialize_json(metadata),
+                        source_run_id,
+                        now,
+                        expires_at,
+                        now,
+                        now,
+                    ),
+                )
+
+    def claim_pending_candidate_cache(
+        self,
+        *,
+        workflow: str,
+        limit: int,
+        run_id: str,
+        lease_expires_at: str,
+    ) -> list[dict[str, Any]]:
+        now = utcnow()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._release_expired_candidate_claims(connection, now=now)
+            rows = connection.execute(
+                """
+                SELECT tweet_id
+                FROM candidate_cache
+                WHERE workflow = ? AND status = 'pending' AND expires_at > ?
+                ORDER BY COALESCE(created_at, created_ts) DESC, updated_ts ASC
+                LIMIT ?
+                """,
+                (workflow, now, limit),
+            ).fetchall()
+            tweet_ids = [str(row["tweet_id"]) for row in rows]
+            if not tweet_ids:
+                return []
+            placeholders = ", ".join("?" for _ in tweet_ids)
+            connection.execute(
+                f"""
+                UPDATE candidate_cache
+                SET status = 'claimed', claim_run_id = ?, claim_expires_at = ?, updated_ts = ?
+                WHERE workflow = ? AND tweet_id IN ({placeholders}) AND status = 'pending'
+                """,
+                (run_id, lease_expires_at, now, workflow, *tweet_ids),
+            )
+            claimed_rows = connection.execute(
+                f"""
+                SELECT workflow, tweet_id, screen_name, created_at, text, metadata_json,
+                       status, reason, source_run_id, claim_run_id, claim_expires_at,
+                       hydrated_at, expires_at, created_ts, updated_ts
+                FROM candidate_cache
+                WHERE workflow = ? AND claim_run_id = ? AND tweet_id IN ({placeholders})
+                ORDER BY COALESCE(created_at, created_ts) DESC, updated_ts ASC
+                """,
+                (workflow, run_id, *tweet_ids),
+            ).fetchall()
+        return [
+            {
+                "workflow": row["workflow"],
+                "tweet_id": row["tweet_id"],
+                "screen_name": row["screen_name"],
+                "created_at": row["created_at"],
+                "text": row["text"],
+                "metadata": _deserialize_json(row["metadata_json"]) or {},
+                "status": row["status"],
+                "reason": row["reason"],
+                "source_run_id": row["source_run_id"],
+                "claim_run_id": row["claim_run_id"],
+                "claim_expires_at": row["claim_expires_at"],
+                "hydrated_at": row["hydrated_at"],
+                "expires_at": row["expires_at"],
+            }
+            for row in claimed_rows
+        ]
+
+    def list_pending_candidate_cache(self, *, workflow: str, limit: int) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT workflow, tweet_id, screen_name, created_at, text, metadata_json,
+                       status, reason, source_run_id, claim_run_id, claim_expires_at,
+                       hydrated_at, expires_at, created_ts, updated_ts
+                FROM candidate_cache
+                WHERE workflow = ? AND status = 'pending' AND expires_at > ?
+                ORDER BY COALESCE(created_at, created_ts) DESC, updated_ts ASC
+                LIMIT ?
+                """,
+                (workflow, utcnow(), limit),
+            ).fetchall()
+        return [
+            {
+                "workflow": row["workflow"],
+                "tweet_id": row["tweet_id"],
+                "screen_name": row["screen_name"],
+                "created_at": row["created_at"],
+                "text": row["text"],
+                "metadata": _deserialize_json(row["metadata_json"]) or {},
+                "status": row["status"],
+                "reason": row["reason"],
+                "source_run_id": row["source_run_id"],
+                "claim_run_id": row["claim_run_id"],
+                "claim_expires_at": row["claim_expires_at"],
+                "hydrated_at": row["hydrated_at"],
+                "expires_at": row["expires_at"],
+            }
+            for row in rows
+        ]
+
+    def reject_candidate_cache(self, *, workflow: str, tweet_id: str, reason: str, expires_at: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE candidate_cache
+                SET status = 'rejected', reason = ?, expires_at = ?, claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+                WHERE workflow = ? AND tweet_id = ?
+                """,
+                (reason, expires_at, utcnow(), workflow, tweet_id),
+            )
+
+    def consume_candidate_cache(self, *, workflow: str, tweet_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM candidate_cache WHERE workflow = ? AND tweet_id = ?",
+                (workflow, tweet_id),
+            )
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:

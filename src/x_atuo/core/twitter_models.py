@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
 
@@ -32,6 +34,7 @@ class TweetRecord:
     tweet_id: str
     text: str
     author: TweetAuthor
+    created_at: datetime | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -47,6 +50,7 @@ class TweetRecord:
                 user_id=str(author.get("id")) if author.get("id") else None,
                 raw=dict(author) if isinstance(author, dict) else {},
             ),
+            created_at=_parse_payload_datetime(payload),
             raw=dict(payload),
         )
 
@@ -57,6 +61,37 @@ class TweetRecord:
     @property
     def verified(self) -> bool:
         return self.author.verified
+
+
+def _parse_payload_datetime(payload: dict[str, Any]) -> datetime | None:
+    for key in ("created_at", "createdAt", "timestamp", "published_at", "publishedAt"):
+        value = payload.get(key)
+        parsed = _coerce_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=UTC)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(text)
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 @dataclass(slots=True, frozen=True)

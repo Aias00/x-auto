@@ -88,8 +88,8 @@ def compose_reply_text(acknowledgment: str, fuller_angle: str, *, max_length: in
     first = parts[0] + "."
     if len(first) >= max_length:
         return first[: max_length - 1].rstrip() + "…"
-    remaining = max_length - len(first) - 1
-    second = parts[1][:remaining].rstrip(" .")
+    remaining = max_length - len(first) - 2
+    second = parts[1][: max(remaining, 0)].rstrip(" .")
     return f"{first} {second}…"
 
 
@@ -231,7 +231,7 @@ class OpenAICompatibleProvider(BaseAIProvider):
 
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         content = self._chat(
-            "Review Twitter feed candidates for reply safety. Reject anything about politics, crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, or case news. Allow technical, product, engineering, and builder content. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
+            "Review Twitter feed candidates for reply safety. Reject anything about politics, crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow only technical, product, engineering, builder, and developer-adjacent content. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
             json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
         )
         try:
