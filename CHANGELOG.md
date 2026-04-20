@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.0 - 2026-04-20
+
+### Features
+- Harden `feed-engage` with candidate refresh loops, newest-first feed ordering, and shortlist caching with lease-based reuse.
+- Add lightweight node observability for fetch, moderation, selection, review, drafting, and execution timings.
+- Add structured tweet timestamps and richer candidate handling for feed selection and reuse.
+
+### Reliability
+- Prevent duplicate replies by executing only the selected candidate and re-entering graph selection on fallback paths.
+- Reuse hydrated shortlist candidates without redundant tweet fetches and clear stale running jobs on service startup.
+- Clamp fallback replies to policy limits and improve scheduler/cache recovery behavior.
+
+### Safety
+- Expand AI moderation coverage to adult, hate, self-harm, gambling, extremism, crypto shills, and high-risk medical/legal content.
+- Apply a final full-text moderation review to the selected candidate before drafting and execution.
+
 ## 0.1.0 - 2026-04-18
 
 ### Features
