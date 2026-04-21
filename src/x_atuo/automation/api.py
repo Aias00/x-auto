@@ -13,6 +13,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request, status
 
 from x_atuo.automation.config import AutomationConfig
+from x_atuo.automation.observability import LangfuseRuntime, build_langfuse_runtime
 from x_atuo.automation.schemas import (
     FeedEngageRequest,
     DirectPostRequest,
@@ -55,6 +56,7 @@ async def _execute_job(
     function_name: str,
     payload: dict[str, Any],
     requested_job_id: str | None,
+    observability_runtime: Any | None = None,
 ) -> dict[str, Any]:
     run_id = str(uuid4())
     job_id = requested_job_id or f"{job_type}-{run_id}"
@@ -83,8 +85,10 @@ async def _execute_job(
             function_name,
             run_id=run_id,
             job_id=job_id,
+            endpoint=endpoint,
             payload=payload,
             storage=storage,
+            observability_runtime=observability_runtime,
         )
         normalized_result = _normalize_result(result)
         run_status = _derive_status(normalized_result)
@@ -115,7 +119,12 @@ async def _execute_job(
     }
 
 
-async def _dispatch_scheduled_request(request_obj: AutomationRequest, storage: AutomationStorage) -> dict[str, Any]:
+async def _dispatch_scheduled_request(
+    request_obj: AutomationRequest,
+    storage: AutomationStorage,
+    *,
+    observability_runtime: Any | None = None,
+) -> dict[str, Any]:
     job_type, function_name, payload, endpoint = _workflow_binding(request_obj)
     return await _execute_job(
         storage=storage,
@@ -124,6 +133,7 @@ async def _dispatch_scheduled_request(request_obj: AutomationRequest, storage: A
         function_name=function_name,
         payload=payload,
         requested_job_id=request_obj.job_name,
+        observability_runtime=observability_runtime,
     )
 
 
@@ -203,14 +213,20 @@ def _build_scheduled_feed_engage(settings: AutomationConfig) -> ScheduledWorkflo
 async def lifespan(app: FastAPI):
     settings = AutomationConfig()
     storage = AutomationStorage(_resolve_db_path())
+    observability_runtime = build_langfuse_runtime(settings)
     storage.initialize()
     storage.clear_stale_running_runs(reason="stale running cleared on service startup")
     app.state.storage = storage
     app.state.settings = settings
+    app.state.observability_runtime = observability_runtime
 
     scheduler = AutomationScheduler(
         settings.scheduler,
-        lambda request_obj: _dispatch_scheduled_request(request_obj, storage),
+        lambda request_obj: _dispatch_scheduled_request(
+            request_obj,
+            storage,
+            observability_runtime=observability_runtime,
+        ),
         on_queue_full=lambda request_obj: _record_dropped_scheduled_request(
             request_obj,
             storage,
@@ -226,7 +242,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        scheduler.shutdown(wait=False)
+        try:
+            scheduler.shutdown(wait=False)
+        finally:
+            observability_runtime.shutdown()
 
 
 app = FastAPI(title="x-atuo automation API", lifespan=lifespan)
@@ -261,8 +280,131 @@ def _build_invoke_kwargs(function: Any, **candidates: Any) -> dict[str, Any]:
     }
 
 
+def _build_runtime_graph(config: AutomationConfig, storage: Any, *, proxy: str | None = None) -> Any:
+    module = _load_graph_module()
+    builder = getattr(module, "_build_runtime_graph", None)
+    if builder is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="automation.graph._build_runtime_graph is not available",
+        )
+    return builder(config, storage, proxy=proxy)
+
+
+def _persist_snapshot(storage: Any, snapshot: Any) -> None:
+    module = _load_graph_module()
+    persist = getattr(module, "_persist_snapshot", None)
+    if persist is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="automation.graph._persist_snapshot is not available",
+        )
+    persist(storage, snapshot)
+
+
+def _workflow_observation_metadata(
+    request_obj: AutomationRequest,
+    config: AutomationConfig,
+    *,
+    endpoint: str,
+) -> dict[str, Any]:
+    return {
+        "run_id": request_obj.run_id,
+        "job_id": request_obj.job_name,
+        "workflow": request_obj.workflow.value,
+        "endpoint": endpoint,
+        "dry_run": request_obj.dry_run,
+        "approval_mode": request_obj.approval_mode,
+        "environment": config.environment,
+    }
+
+
+def _snapshot_response(snapshot: Any) -> dict[str, Any]:
+    return {
+        "status": snapshot.status.value,
+        "run_id": snapshot.run_id,
+        "result": snapshot.result.model_dump(mode="json") if snapshot.result else None,
+        "candidate_refresh_count": snapshot.candidate_refresh_count,
+        "selected_candidate": snapshot.selected_candidate.model_dump(mode="json") if snapshot.selected_candidate else None,
+        "rendered_text": snapshot.rendered_text,
+        "selection_source": snapshot.selection_source,
+        "selection_reason": snapshot.selection_reason,
+        "drafted_by": snapshot.drafting_source,
+        "errors": snapshot.errors,
+        "events": [event.model_dump(mode="json") for event in snapshot.events],
+    }
+
+
+def _workflow_failure_marker(snapshot: Any) -> Exception | None:
+    status_value = getattr(getattr(snapshot, "status", None), "value", None)
+    if status_value != "failed":
+        return None
+
+    errors = getattr(snapshot, "errors", None)
+    if isinstance(errors, list):
+        messages = [str(item).strip() for item in errors if str(item).strip()]
+        if messages:
+            return RuntimeError("; ".join(messages))
+    return RuntimeError("workflow ended with failed status")
+
+
+async def _run_request(
+    request: AutomationRequest,
+    *,
+    storage: Any,
+    endpoint: str,
+    proxy: str | None = None,
+    observability_runtime: Any | None = None,
+) -> dict[str, Any]:
+    config = AutomationConfig()
+    runtime = observability_runtime if observability_runtime is not None else LangfuseRuntime()
+    graph = _build_runtime_graph(config, storage, proxy=proxy)
+    run_name = f"x-atuo.{request.workflow.value}"
+    observation = runtime.start_workflow_observation(
+        run_name=run_name,
+        metadata=_workflow_observation_metadata(request, config, endpoint=endpoint),
+    )
+    graph_config = runtime.build_graph_config(run_name=run_name, observation=observation)
+
+    snapshot: Any | None = None
+    error: Exception | None = None
+    try:
+        snapshot = await graph.invoke(request, graph_config=graph_config)
+        error = _workflow_failure_marker(snapshot)
+        _persist_snapshot(storage, snapshot)
+        return _snapshot_response(snapshot)
+    except Exception as exc:
+        error = exc
+        raise
+    finally:
+        runtime.finish_workflow_observation(
+            observation,
+            output=None if snapshot is None else {"status": snapshot.status.value, "run_id": snapshot.run_id},
+            error=error,
+        )
+
+
 async def _call_graph(function_name: str, **kwargs: Any) -> Any:
     module = _load_graph_module()
+    bind_request = getattr(module, "build_request_binding", None)
+    request_binding = None
+    if callable(bind_request):
+        request_binding = bind_request(
+            function_name,
+            run_id=kwargs["run_id"],
+            job_id=kwargs["job_id"],
+            payload=kwargs["payload"],
+        )
+    if request_binding is not None:
+        request_obj, proxy = request_binding
+        return await _run_request(
+            request_obj,
+            storage=kwargs["storage"],
+            endpoint=kwargs["endpoint"],
+            proxy=proxy,
+            observability_runtime=kwargs.get("observability_runtime"),
+        )
+
     function = getattr(module, function_name, None)
     if function is None:
         raise HTTPException(
@@ -307,6 +449,7 @@ async def _execute_webhook(
 ) -> WebhookAcceptedResponse:
     accepted_at = datetime.now(timezone.utc)
     storage = get_storage(request)
+    observability_runtime = getattr(request.app.state, "observability_runtime", None)
 
     try:
         record = await _execute_job(
@@ -316,6 +459,7 @@ async def _execute_webhook(
             function_name=function_name,
             payload=payload,
             requested_job_id=requested_job_id,
+            observability_runtime=observability_runtime,
         )
         return WebhookAcceptedResponse(
             run_id=record["run_id"],

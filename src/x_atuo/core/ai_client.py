@@ -38,21 +38,6 @@ class AIModerationResult:
 
 
 @dataclass(slots=True, frozen=True)
-class AIReplyContextPlan:
-    needs_live_search: bool
-    search_query: str | None
-    acknowledgment: str
-    fuller_angle: str
-    rationale: str
-
-
-@dataclass(slots=True, frozen=True)
-class AIEnhancementDecision:
-    should_enrich: bool
-    reason: str
-
-
-@dataclass(slots=True, frozen=True)
 class AIReplyStyleDecision:
     style: str
     reason: str
@@ -65,16 +50,6 @@ class BaseAIProvider:
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         raise NotImplementedError
 
-    def decide_reply_enhancement(
-        self,
-        candidate: FeedCandidate,
-        base_reply_text: str,
-    ) -> AIEnhancementDecision:
-        raise NotImplementedError
-
-    def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
-        raise NotImplementedError
-
     def draft_reply(self, candidate: FeedCandidate, context: dict[str, Any] | None = None) -> AIDraftResult:
         raise NotImplementedError
 
@@ -83,23 +58,6 @@ class BaseAIProvider:
 
     def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
         raise NotImplementedError
-
-
-def compose_reply_text(acknowledgment: str, fuller_angle: str, *, max_length: int = 140) -> str:
-    parts = [item.strip().rstrip(".") for item in (acknowledgment, fuller_angle) if item and item.strip()]
-    if not parts:
-        return "The real win here is how much complexity this strips out."
-    text = ". ".join(parts) + "."
-    if len(text) <= max_length:
-        return text
-    if len(parts) == 1:
-        return text[: max_length - 1].rstrip() + "…"
-    first = parts[0] + "."
-    if len(first) >= max_length:
-        return first[: max_length - 1].rstrip() + "…"
-    remaining = max_length - len(first) - 2
-    second = parts[1][: max(remaining, 0)].rstrip(" .")
-    return f"{first} {second}…"
 
 
 def _compact_candidate_payload(
@@ -157,36 +115,7 @@ class MockAIProvider(BaseAIProvider):
             for candidate in candidates
         ]
 
-    def decide_reply_enhancement(
-        self,
-        candidate: FeedCandidate,
-        base_reply_text: str,
-    ) -> AIEnhancementDecision:
-        return AIEnhancementDecision(
-            should_enrich=False,
-            reason="mock provider keeps the base reply when it is already serviceable",
-        )
-
-    def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
-        return AIReplyContextPlan(
-            needs_live_search=False,
-            search_query=None,
-            acknowledgment="That headline is directionally right.",
-            fuller_angle="The more important signal is how the product handles retrieval in practice.",
-            rationale="mock provider adds a fuller angle after acknowledging the post",
-        )
-
     def draft_reply(self, candidate: FeedCandidate, context: dict[str, Any] | None = None) -> AIDraftResult:
-        if context and isinstance(context.get("reply_brief"), dict):
-            brief = context["reply_brief"]
-            text = compose_reply_text(
-                str(brief.get("acknowledgment") or ""),
-                str(brief.get("fuller_angle") or ""),
-            )
-            return AIDraftResult(
-                text=text,
-                rationale="mock provider generated a context-aware technical reply",
-            )
         handle = candidate.screen_name or "author"
         return AIDraftResult(
             text=f"@{handle} The real shift here is where the bottleneck moves next.",
@@ -295,50 +224,6 @@ class OpenAICompatibleProvider(BaseAIProvider):
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AIProviderError(f"Could not parse AI moderation response: {content}") from exc
 
-    def decide_reply_enhancement(
-        self,
-        candidate: FeedCandidate,
-        base_reply_text: str,
-    ) -> AIEnhancementDecision:
-        candidate_payload = candidate.model_dump(mode="json")
-        content = self._chat(
-            "Decide whether a base Twitter reply needs deeper enhancement before publishing. "
-            "Only request enhancement when the base reply is too generic, risks missing key context, or likely needs live/current evidence. "
-            "If the base reply is already specific enough, keep it. Return JSON with should_enrich and reason.",
-            json.dumps(
-                {
-                    "candidate": _compact_candidate_payload(candidate_payload),
-                    "base_reply_text": base_reply_text,
-                },
-                ensure_ascii=False,
-            ),
-        )
-        try:
-            parsed = self._parse_json_content(content)
-            return AIEnhancementDecision(
-                should_enrich=bool(parsed.get("should_enrich")),
-                reason=str(parsed.get("reason") or ""),
-            )
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"Could not parse AI enhancement decision: {content}") from exc
-
-    def plan_reply_context(self, candidate: FeedCandidate, context: dict[str, Any]) -> AIReplyContextPlan:
-        content = self._chat(
-            "Analyze a tweet reply context pack. Decide whether external live web search is needed before replying. Prefer acknowledging what is valid in the post, then naming the fuller angle that matters more. Use live search only for time-sensitive facts, product capability checks, release/version claims, or production-readiness judgments. Return JSON with needs_live_search, search_query, acknowledgment, fuller_angle, and rationale.",
-            json.dumps({"candidate": candidate.model_dump(mode="json"), "context": context}, ensure_ascii=False),
-        )
-        try:
-            parsed = self._parse_json_content(content)
-            return AIReplyContextPlan(
-                needs_live_search=bool(parsed.get("needs_live_search")),
-                search_query=str(parsed["search_query"]) if parsed.get("search_query") else None,
-                acknowledgment=str(parsed.get("acknowledgment") or ""),
-                fuller_angle=str(parsed.get("fuller_angle") or ""),
-                rationale=str(parsed.get("rationale") or ""),
-            )
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"Could not parse AI reply context plan: {content}") from exc
-
     def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
         content = self._chat(
             "Classify the best reply style for a Twitter post. Return JSON with style and reason. Use style=technical for engineering, developer, product, infrastructure, AI, coding, or tooling posts. Use style=non_technical for pets, animals, lifestyle, food, travel, scenic, entertainment, meme, casual social, image-first, or reaction posts. Use style=mixed when the post mixes casual content with product or AI references.",
@@ -384,16 +269,6 @@ class OpenAICompatibleProvider(BaseAIProvider):
                 include_media_types=True,
             )
         }
-        if context and any(key != "reply_style" for key in context):
-            system = (
-                "Draft one short technical Twitter reply under 100 chars. "
-                "First acknowledge the valid point in the post, then add a fuller angle from the surrounding context. "
-                "Use author profile, recent posts, reply summary, and live knowledge evidence only when they materially improve the reply. "
-                "Write like a sharp practitioner, not a summarizer. Keep it conversational and plainspoken. "
-                "Prefer a direct statement, not a question. Avoid generic praise, repetition, and simply restating the post. "
-                "One or two short sentences. No lists. No emojis. Return JSON with text and rationale."
-            )
-            user_payload["context"] = context
         content = self._chat(system, json.dumps(user_payload, ensure_ascii=False))
         try:
             parsed = self._parse_json_content(content)

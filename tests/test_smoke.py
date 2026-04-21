@@ -28,7 +28,6 @@ from x_atuo.automation.storage import AutomationStorage
 import x_atuo.automation.api as automation_api
 from x_atuo.core.ai_client import AIProviderError
 from x_atuo.core.ai_client import OpenAICompatibleProvider
-from x_atuo.core.ai_client import compose_reply_text
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_client import TwitterCredentials
 from x_atuo.core.twitter_models import TweetRecord
@@ -116,7 +115,6 @@ def test_prefilter_candidates_filters_unverified_without_policy_hooks() -> None:
         for event in result["snapshot"].events
     )
 
-
 def test_prefilter_candidates_filters_reply_restricted_before_selection() -> None:
     graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=None))
     request = AutomationRequest.for_feed_engage(job_name="job")
@@ -143,17 +141,6 @@ def test_prefilter_candidates_filters_reply_restricted_before_selection() -> Non
         and event.payload["reason"] == "Only some accounts can reply."
         for event in result["snapshot"].events
     )
-
-
-def test_compose_reply_text_never_exceeds_max_length() -> None:
-    acknowledgment = "A" * 10
-    fuller_angle = "B" * 20
-
-    text = compose_reply_text(acknowledgment, fuller_angle, max_length=20)
-
-    assert len(text) <= 20
-
-
 def test_tweet_record_parses_created_at() -> None:
     tweet = TweetRecord.from_payload(
         {
@@ -1601,49 +1588,6 @@ def test_feed_engage_allows_elonmusk_candidates_even_if_ai_moderation_rejects(mo
         event["node"] == "selected_candidate_review" and event["message"] == "selected candidate filtered by ai moderation"
         for event in body["result"]["events"]
     )
-
-
-def test_openai_compatible_provider_uses_compact_reply_enhancement_payload() -> None:
-    provider = OpenAICompatibleProvider(
-        AISettings(
-            provider="openai_compatible",
-            model="demo-model",
-            api_key="demo-key",
-            base_url="https://example.com/v1",
-        )
-    )
-    prompts: list[tuple[str, str]] = []
-
-    def fake_chat(system: str, user: str) -> str:
-        prompts.append((system, user))
-        return '{"should_enrich":false,"reason":"base reply is already specific enough"}'
-
-    provider._chat = fake_chat  # type: ignore[method-assign]
-
-    decision = provider.decide_reply_enhancement(
-        type(
-            "Candidate",
-            (),
-            {
-                "model_dump": lambda self, mode="json": {
-                    "tweet_id": "1",
-                    "screen_name": "builder",
-                    "text": "preview text",
-                    "metadata": {"raw": "should_not_be_sent"},
-                }
-            },
-        )(),
-        "preview text. The real test is whether it holds up in production.",
-    )
-
-    payload = __import__("json").loads(prompts[0][1])
-    assert decision.should_enrich is False
-    assert payload["candidate"] == {
-        "tweet_id": "1",
-        "screen_name": "builder",
-        "text": "preview text",
-    }
-    assert "metadata" not in payload["candidate"]
 
 
 def test_openai_compatible_provider_uses_compact_draft_reply_payload_with_media_types() -> None:
@@ -4092,12 +4036,6 @@ def test_feed_engage_ai_draft_does_not_use_author_history_or_reply_context(monke
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "time-sensitive model update"})()
 
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("reply context planning should not be called")
-
         def draft_reply(self, candidate, context=None):
             assert context == {"reply_style": "technical"}
             return type(
@@ -4186,12 +4124,6 @@ def test_feed_engage_fallback_uses_tweet_text_without_extra_ai_draft(monkeypatch
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "needs context"})()
 
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("reply context planning should not be called")
-
         def draft_reply(self, candidate, context=None):
             raise AIProviderError("base ai draft failed")
 
@@ -4270,12 +4202,6 @@ def test_feed_engage_ai_draft_does_not_use_live_search(monkeypatch, tmp_path: Pa
 
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "needs current context"})()
-
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
             assert context == {"reply_style": "technical"}
@@ -4376,12 +4302,6 @@ def test_feed_engage_draft_reply_skips_enrichment_context(monkeypatch, tmp_path:
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "good candidate"})()
 
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("reply context planning should not be called")
-
         def draft_reply(self, candidate, context=None):
             assert context == {"reply_style": "technical"}
             return type(
@@ -4462,12 +4382,6 @@ def test_feed_engage_clips_fallback_reply_to_280_chars(monkeypatch, tmp_path: Pa
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "good candidate"})()
 
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("enhancement should be skipped when lightweight gate says no")
-
         def draft_reply(self, candidate, context=None):
             raise AIProviderError("draft failed, force fallback")
 
@@ -4530,12 +4444,6 @@ def test_feed_engage_uses_base_ai_draft_without_enrichment(monkeypatch, tmp_path
 
         def select_candidate(self, candidates):
             return type("Selection", (), {"tweet_id": "111", "reason": "good candidate"})()
-
-        def decide_reply_enhancement(self, candidate, base_reply_text):
-            raise AssertionError("enrichment gate should not be called")
-
-        def plan_reply_context(self, candidate, context):
-            raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
             assert context == {"reply_style": "technical"}

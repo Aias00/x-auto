@@ -23,6 +23,10 @@ Twitter automation service for webhook- and schedule-driven workflows, with Lang
 - Twitter execution reads credentials from `~/.agent-reach/config.yaml`
 - If `twitter_auth_token` / `twitter_ct0` are absent there, it falls back to `TWITTER_AUTH_TOKEN` and `TWITTER_CT0`
 - Proxy can be passed per request, or defaulted in automation config
+- Langfuse tracing is optional
+  - set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` to enable it
+  - `LANGFUSE_BASE_URL` and `LANGFUSE_TRACING_ENVIRONMENT` are optional Langfuse client settings
+  - when the required keys are absent, the runtime falls back to a no-op observability path
 - `feed-engage` runs AI candidate moderation on feed previews before selection when an AI provider is configured; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out
 - `feed-engage` trims the candidate pool to a newest-first shortlist, hydrates that shortlist with full tweet text, then runs AI selection and a final single-candidate full-text review before drafting
 - hydrated shortlist candidates are cached in SQLite and reused across runs before refetching feed; cached candidates are leased to a single run at a time and expire automatically
