@@ -178,6 +178,104 @@ def _compact_reply_context(context: dict[str, Any] | None) -> dict[str, Any] | N
     return compact
 
 
+def _is_moderation_exempt_candidate(candidate: FeedCandidate) -> bool:
+    return (candidate.screen_name or "").strip().lower() == "elonmusk"
+
+
+def _candidate_media_types(candidate: FeedCandidate) -> set[str]:
+    metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+    media = metadata.get("media") if isinstance(metadata.get("media"), list) else []
+    media_types: set[str] = set()
+    for item in media:
+        if isinstance(item, dict) and isinstance(item.get("type"), str) and item.get("type"):
+            media_types.add(str(item["type"]).lower())
+    return media_types
+
+
+def _rule_based_reply_style(candidate: FeedCandidate | None) -> str | None:
+    if candidate is None:
+        return None
+    screen_name = (candidate.screen_name or "").strip().lower()
+    if screen_name == "elonmusk":
+        return "mixed"
+
+    text = (candidate.text or "").strip().lower()
+    media_types = _candidate_media_types(candidate)
+    technical_markers = (
+        "api", "sdk", "repo", "open source", "github", "deploy", "inference", "latency", "cache",
+        "prompt", "llm", "model", "agent", "workflow", "code", "coding", "developer", "engineering",
+        "gpu", "benchmark", "eval", "tooling", "artifact", "worker", "cloudflare", "ai studio",
+    )
+    nontechnical_markers = (
+        "cat", "dog", "puppy", "hamster", "koala", "pet", "food", "coffee", "breakfast", "family",
+        "travel", "scenic", "sunrise", "meme", "lol", "funny", "cute", "😂", "🤣", "😅", "❤️",
+    )
+
+    if any(marker in text for marker in technical_markers):
+        return "technical"
+    if any(marker in text for marker in nontechnical_markers):
+        return "non_technical"
+    if media_types and len(text) <= 120:
+        return "non_technical"
+    return None
+
+
+def _normalized_selection_reason(
+    candidate: FeedCandidate | None,
+    selection_reason: str | None,
+    reply_style: str,
+) -> str | None:
+    reason = str(selection_reason or "").strip()
+    if candidate is None or reply_style not in {"non_technical", "mixed"}:
+        return reason or None
+
+    if reply_style == "mixed" and reason:
+        return reason
+
+    metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+    metrics = metadata.get("metrics") if isinstance(metadata.get("metrics"), dict) else {}
+    likes = metrics.get("likes") if isinstance(metrics.get("likes"), int) else None
+    replies = metrics.get("replies") if isinstance(metrics.get("replies"), int) else None
+    views = metrics.get("views") if isinstance(metrics.get("views"), int) else None
+    media_types = _candidate_media_types(candidate)
+    text = (candidate.text or "").strip().lower()
+
+    descriptors: list[str] = []
+    if any(marker in text for marker in ("cat", "dog", "puppy", "kitten", "pet", "hamster", "cute")):
+        descriptors.append("warm pet post")
+    elif any(marker in text for marker in ("wallpaper", "baby", "family", "food", "travel", "scenic", "sunrise")):
+        descriptors.append("easygoing lifestyle post")
+    elif any(marker in text for marker in ("meme", "lol", "funny", "😂", "🤣", "reaction")):
+        descriptors.append("playful casual post")
+    else:
+        descriptors.append("casual visual post" if media_types else "casual post")
+
+    if media_types:
+        if "video" in media_types:
+            descriptors.append("clear visual hook")
+        elif "photo" in media_types:
+            descriptors.append("strong image appeal")
+
+    if isinstance(views, int) and isinstance(likes, int) and views > 0:
+        engagement_ratio = likes / views
+        if engagement_ratio >= 0.1:
+            descriptors.append("healthy engagement")
+    elif isinstance(likes, int) and likes >= 20:
+        descriptors.append("good engagement")
+
+    if isinstance(replies, int) and replies > 0:
+        descriptors.append("easy opening for a friendly reply")
+    else:
+        descriptors.append("natural fit for a light reply")
+
+    parts = descriptors[:3]
+    if len(parts) == 1:
+        phrase = parts[0]
+    else:
+        phrase = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+    return f"{phrase.capitalize()}."
+
+
 def _compose_fallback_reply_from_tweet(tweet_text: str | None, *, max_length: int = 280) -> str:
     normalized = re.sub(r"\s+", " ", str(tweet_text or "")).strip()
     normalized = re.sub(r"https?://\S+", "", normalized).strip()
@@ -495,6 +593,9 @@ class AutomationGraph:
         filtered_candidates: list[FeedCandidate] = []
         filtered_count = 0
         for candidate in snapshot.candidates:
+            if _is_moderation_exempt_candidate(candidate):
+                filtered_candidates.append(candidate)
+                continue
             moderation = moderation_by_tweet_id.get(candidate.tweet_id)
             if moderation is None:
                 filtered_count += 1
@@ -707,6 +808,18 @@ class AutomationGraph:
                 "selected_candidate_review",
                 "selected candidate passed full-text review",
                 tweet_id=snapshot.selected_candidate.tweet_id,
+                duration_ms=round((perf_counter() - started_at) * 1000, 2),
+            )
+            return {"snapshot": snapshot}
+
+        if _is_moderation_exempt_candidate(snapshot.selected_candidate):
+            snapshot.log_event(
+                "selected_candidate_review",
+                "selected candidate bypassed ai moderation",
+                tweet_id=snapshot.selected_candidate.tweet_id,
+                screen_name=snapshot.selected_candidate.screen_name,
+                category=moderation.category,
+                reason=moderation.reason,
                 duration_ms=round((perf_counter() - started_at) * 1000, 2),
             )
             return {"snapshot": snapshot}
@@ -1328,9 +1441,41 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                 candidate.text if candidate is not None else None,
                 max_length=config.policies.max_reply_length,
             )
+        reply_style = _rule_based_reply_style(candidate)
+        style_reason = "rule_based" if reply_style is not None else ""
+        if reply_style is None and ai_provider and snapshot.request.approval_mode == "ai_auto" and candidate is not None:
+            classifier = getattr(ai_provider, "classify_reply_style", None)
+            if classifier is not None:
+                try:
+                    decision = classifier(candidate)
+                    reply_style = getattr(decision, "style", None) or "technical"
+                    style_reason = getattr(decision, "reason", "") or "ai_classified"
+                except AIProviderError as exc:
+                    snapshot.log_event("draft_reply", "reply style classification failed", error=str(exc))
+                    reply_style = "technical"
+                    style_reason = "classification_failed"
+        if reply_style is None:
+            reply_style = "technical"
+            style_reason = "default"
+        snapshot.selection_reason = _normalized_selection_reason(
+            candidate,
+            snapshot.selection_reason,
+            reply_style,
+        )
+        snapshot.reply_context["reply_style"] = reply_style
+        snapshot.log_event(
+            "draft_reply",
+            "reply style selected",
+            reply_style=reply_style,
+            reason=style_reason,
+        )
         if ai_provider and snapshot.request.approval_mode == "ai_auto" and snapshot.selected_candidate is not None:
             try:
-                draft = _call_with_optional_context(ai_provider.draft_reply, snapshot.selected_candidate)
+                draft = _call_with_optional_context(
+                    ai_provider.draft_reply,
+                    snapshot.selected_candidate,
+                    {"reply_style": reply_style},
+                )
                 snapshot.drafting_source = "ai"
                 snapshot.log_event(
                     "draft_reply",

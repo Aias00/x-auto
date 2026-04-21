@@ -1309,7 +1309,86 @@ def test_openai_compatible_provider_uses_candidate_moderation_prompt() -> None:
     assert results[0].tweet_id == "1"
     assert results[0].allowed is True
     assert prompts[0][0] == (
-        "Review Twitter feed candidates for reply safety. Reject anything about politics, crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow only technical, product, engineering, builder, and developer-adjacent content. Return JSON with a results array of {tweet_id, allowed, category, reason}."
+        "Review Twitter feed candidates for reply safety. Reject anything about crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow technical, product, engineering, builder, developer-adjacent, pets and animals, lifestyle, food, travel, scenic photography, entertainment, memes, and casual social content. Always allow posts from @elonmusk. Return JSON with a results array of {tweet_id, allowed, category, reason}."
+    )
+
+
+def test_feed_engage_allows_elonmusk_candidates_even_if_ai_moderation_rejects(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "elonmusk", "DOGE update and government fraud thread")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "elonmusk", "DOGE full text and government fraud details")
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type(
+                    "Moderation",
+                    (),
+                    {
+                        "tweet_id": candidate.tweet_id,
+                        "allowed": False,
+                        "category": "Politics/Government",
+                        "reason": "would normally be rejected",
+                    },
+                )()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            assert [candidate.tweet_id for candidate in candidates] == ["111"]
+            return type("Selection", (), {"tweet_id": "111", "reason": "only remaining candidate"})()
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "Execution follows incentive design, not slogans.", "rationale": "safe"})()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "elon-moderation-bypass.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["result"]["selected_candidate"]["tweet_id"] == "111"
+    assert not any(
+        event["node"] == "moderate_candidates" and event["message"] == "candidate filtered by ai moderation"
+        for event in body["result"]["events"]
+    )
+    assert not any(
+        event["node"] == "selected_candidate_review" and event["message"] == "selected candidate filtered by ai moderation"
+        for event in body["result"]["events"]
     )
 
 
@@ -1354,6 +1433,248 @@ def test_openai_compatible_provider_uses_compact_reply_enhancement_payload() -> 
         "text": "preview text",
     }
     assert "metadata" not in payload["candidate"]
+
+
+def test_openai_compatible_provider_uses_compact_draft_reply_payload_with_media_types() -> None:
+    provider = OpenAICompatibleProvider(
+        AISettings(
+            provider="openai_compatible",
+            model="demo-model",
+            api_key="demo-key",
+            base_url="https://example.com/v1",
+        )
+    )
+    prompts: list[tuple[str, str]] = []
+
+    def fake_chat(system: str, user: str) -> str:
+        prompts.append((system, user))
+        return '{"text":"Infra bottlenecks show up fast on video-heavy flows.","rationale":"compact payload"}'
+
+    provider._chat = fake_chat  # type: ignore[method-assign]
+
+    result = provider.draft_reply(
+        type(
+            "Candidate",
+            (),
+            {
+                "model_dump": lambda self, mode="json": {
+                    "tweet_id": "1",
+                    "screen_name": "builder",
+                    "text": "preview text",
+                    "created_at": "2026-04-20T13:26:19Z",
+                    "author_verified": True,
+                    "metadata": {
+                        "media": [
+                            {"type": "video", "url": "https://example.com/video.mp4"},
+                            {"type": "photo", "url": "https://example.com/image.jpg"},
+                            {"type": "video", "url": "https://example.com/video-2.mp4"},
+                        ],
+                        "raw": "should_not_be_sent",
+                    },
+                }
+            },
+        )()
+    )
+
+    payload = __import__("json").loads(prompts[0][1])
+    assert result.text == "Infra bottlenecks show up fast on video-heavy flows."
+    assert payload["candidate"] == {
+        "tweet_id": "1",
+        "screen_name": "builder",
+        "text": "preview text",
+        "created_at": "2026-04-20T13:26:19Z",
+        "author_verified": True,
+        "media_types": ["video", "photo"],
+    }
+    assert "metadata" not in payload["candidate"]
+
+
+def test_openai_compatible_provider_uses_non_technical_reply_prompt() -> None:
+    provider = OpenAICompatibleProvider(
+        AISettings(
+            provider="openai_compatible",
+            model="demo-model",
+            api_key="demo-key",
+            base_url="https://example.com/v1",
+        )
+    )
+    prompts: list[tuple[str, str]] = []
+
+    def fake_chat(system: str, user: str) -> str:
+        prompts.append((system, user))
+        return '{"text":"That dog looks way too pleased with itself.","rationale":"non technical tone"}'
+
+    provider._chat = fake_chat  # type: ignore[method-assign]
+
+    result = provider.draft_reply(
+        type(
+            "Candidate",
+            (),
+            {
+                "model_dump": lambda self, mode="json": {
+                    "tweet_id": "1",
+                    "screen_name": "petposter",
+                    "text": "cloud-like puppy in the wind",
+                    "metadata": {"media": [{"type": "photo"}]},
+                }
+            },
+        )(),
+        {"reply_style": "non_technical"},
+    )
+
+    assert result.text == "That dog looks way too pleased with itself."
+    assert prompts[0][0] == (
+        "Draft one short Twitter reply under 100 chars for a non-technical post. "
+        "Sound natural, relaxed, and human. Lead with a light observation, mild reaction, gentle humor, or easy empathy. "
+        "Do not force technical jargon, engineering framing, or heavy analysis onto the post. "
+        "Keep it conversational and plainspoken. One or two short sentences. Prefer statements over questions. No lists. No emojis. Return JSON with text and rationale."
+    )
+
+
+def test_feed_engage_uses_non_technical_reply_style_for_pet_content(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "media": [{"type": "photo"}],
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "cutepets", "Cloud puppy")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "cutepets", "Cloud puppy")
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": "111", "allowed": True, "category": None, "reason": "allowed"})()
+                for _ in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type("Selection", (), {"tweet_id": "111", "reason": "only candidate"})()
+
+        def classify_reply_style(self, candidate):
+            return type("Style", (), {"style": "non_technical", "reason": "pet content"})()
+
+        def draft_reply(self, candidate, context=None):
+            assert context is not None
+            assert context["reply_style"] == "non_technical"
+            return type("Draft", (), {"text": "That dog looks absurdly calm for a cloud.", "rationale": "light observation"})()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "nontechnical-style.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert any(
+        event["node"] == "draft_reply"
+        and event["message"] == "reply style selected"
+        and event["payload"]["reply_style"] == "non_technical"
+        for event in body["result"]["events"]
+    )
+
+
+def test_feed_engage_normalizes_selection_reason_for_non_technical_content(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "media": [{"type": "photo"}],
+                "metrics": {"likes": 42, "replies": 2, "views": 240},
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "cutepets", "Cloud puppy")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "cutepets", "Cloud puppy")
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": "111", "allowed": True, "category": None, "reason": "allowed"})()
+                for _ in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            return type(
+                "Selection",
+                (),
+                {
+                    "tweet_id": "111",
+                    "reason": "Highest engagement metrics and high-resolution media make it optimal for technical analysis of content distribution and platform image delivery optimization.",
+                },
+            )()
+
+        def classify_reply_style(self, candidate):
+            return type("Style", (), {"style": "non_technical", "reason": "pet content"})()
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "That pup looks completely at ease.", "rationale": "soft tone"})()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "nontechnical-selection-reason.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 1, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    reason = body["result"]["result"]["detail"]["selection_reason"]
+    assert reason == "Warm pet post, strong image appeal, and healthy engagement."
 
 
 def test_ai_auto_uses_single_selection_and_single_draft(monkeypatch, tmp_path: Path) -> None:
@@ -3471,7 +3792,7 @@ def test_feed_engage_ai_draft_does_not_use_author_history_or_reply_context(monke
             raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
-            assert context is None
+            assert context == {"reply_style": "technical"}
             return type(
                 "Draft",
                 (),
@@ -3650,7 +3971,7 @@ def test_feed_engage_ai_draft_does_not_use_live_search(monkeypatch, tmp_path: Pa
             raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
-            assert context is None
+            assert context == {"reply_style": "technical"}
             return type(
                 "Draft",
                 (),
@@ -3755,7 +4076,7 @@ def test_feed_engage_draft_reply_skips_enrichment_context(monkeypatch, tmp_path:
             raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
-            assert context is None
+            assert context == {"reply_style": "technical"}
             return type(
                 "Draft",
                 (),
@@ -3910,7 +4231,7 @@ def test_feed_engage_uses_base_ai_draft_without_enrichment(monkeypatch, tmp_path
             raise AssertionError("reply context planning should not be called")
 
         def draft_reply(self, candidate, context=None):
-            assert context is None
+            assert context == {"reply_style": "technical"}
             return type(
                 "Draft",
                 (),

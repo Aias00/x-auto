@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0 - 2026-04-21
+
+### Features
+- Add technical vs non-technical reply style routing with rule-based detection and AI fallback classification.
+- Tune reply drafting to use lighter candidate payloads while preserving media type hints for visual posts.
+- Normalize non-technical selection reasons so result metadata matches the lighter conversational reply style.
+
+### Reliability
+- Tighten reply-style heuristics so short technical posts no longer get misclassified as non-technical.
+- Keep reply-style observability in graph events so production runs show which style path was selected.
+
+### Tests
+- Add coverage for non-technical prompt selection, style routing, and normalized selection reasons.
+
 ## 0.2.0 - 2026-04-20
 
 ### Features

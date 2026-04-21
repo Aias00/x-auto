@@ -52,6 +52,12 @@ class AIEnhancementDecision:
     reason: str
 
 
+@dataclass(slots=True, frozen=True)
+class AIReplyStyleDecision:
+    style: str
+    reason: str
+
+
 class BaseAIProvider:
     def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
         raise NotImplementedError
@@ -70,6 +76,9 @@ class BaseAIProvider:
         raise NotImplementedError
 
     def draft_reply(self, candidate: FeedCandidate, context: dict[str, Any] | None = None) -> AIDraftResult:
+        raise NotImplementedError
+
+    def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
         raise NotImplementedError
 
     def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
@@ -91,6 +100,38 @@ def compose_reply_text(acknowledgment: str, fuller_angle: str, *, max_length: in
     remaining = max_length - len(first) - 2
     second = parts[1][: max(remaining, 0)].rstrip(" .")
     return f"{first} {second}…"
+
+
+def _compact_candidate_payload(
+    candidate_payload: dict[str, Any],
+    *,
+    include_media_types: bool = False,
+) -> dict[str, Any]:
+    compact = {
+        key: candidate_payload[key]
+        for key in ("tweet_id", "screen_name", "text", "created_at", "author_verified")
+        if candidate_payload.get(key) is not None
+    }
+    if not include_media_types:
+        return compact
+
+    metadata = candidate_payload.get("metadata")
+    media = metadata.get("media") if isinstance(metadata, dict) else None
+    if not isinstance(media, list):
+        return compact
+
+    media_types: list[str] = []
+    for item in media:
+        if not isinstance(item, dict):
+            continue
+        media_type = item.get("type")
+        if not isinstance(media_type, str) or not media_type:
+            continue
+        if media_type not in media_types:
+            media_types.append(media_type)
+    if media_types:
+        compact["media_types"] = media_types
+    return compact
 
 
 class MockAIProvider(BaseAIProvider):
@@ -151,6 +192,9 @@ class MockAIProvider(BaseAIProvider):
             text=f"@{handle} The real shift here is where the bottleneck moves next.",
             rationale="mock provider generated a shorter technical reply",
         )
+
+    def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
+        return AIReplyStyleDecision(style="technical", reason="mock provider default")
 
     def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
         repo_name = context.repo_name or context.repo_url
@@ -220,7 +264,7 @@ class OpenAICompatibleProvider(BaseAIProvider):
 
     def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
         content = self._chat(
-            "Select one Twitter candidate for technical engagement. Return JSON with tweet_id and reason.",
+            "Select one Twitter candidate for engagement. Return JSON with tweet_id and reason. Keep the reason short, plain-English, and matched to the post itself instead of forcing technical framing.",
             json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
         )
         try:
@@ -231,7 +275,7 @@ class OpenAICompatibleProvider(BaseAIProvider):
 
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         content = self._chat(
-            "Review Twitter feed candidates for reply safety. Reject anything about politics, crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow only technical, product, engineering, builder, and developer-adjacent content. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
+            "Review Twitter feed candidates for reply safety. Reject anything about crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow technical, product, engineering, builder, developer-adjacent, pets and animals, lifestyle, food, travel, scenic photography, entertainment, memes, and casual social content. Always allow posts from @elonmusk. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
             json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
         )
         try:
@@ -263,11 +307,7 @@ class OpenAICompatibleProvider(BaseAIProvider):
             "If the base reply is already specific enough, keep it. Return JSON with should_enrich and reason.",
             json.dumps(
                 {
-                    "candidate": {
-                        "tweet_id": candidate_payload.get("tweet_id"),
-                        "screen_name": candidate_payload.get("screen_name"),
-                        "text": candidate_payload.get("text"),
-                    },
+                    "candidate": _compact_candidate_payload(candidate_payload),
                     "base_reply_text": base_reply_text,
                 },
                 ensure_ascii=False,
@@ -299,7 +339,25 @@ class OpenAICompatibleProvider(BaseAIProvider):
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AIProviderError(f"Could not parse AI reply context plan: {content}") from exc
 
+    def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
+        content = self._chat(
+            "Classify the best reply style for a Twitter post. Return JSON with style and reason. Use style=technical for engineering, developer, product, infrastructure, AI, coding, or tooling posts. Use style=non_technical for pets, animals, lifestyle, food, travel, scenic, entertainment, meme, casual social, image-first, or reaction posts. Use style=mixed when the post mixes casual content with product or AI references.",
+            json.dumps(
+                {"candidate": _compact_candidate_payload(candidate.model_dump(mode="json"), include_media_types=True)},
+                ensure_ascii=False,
+            ),
+        )
+        try:
+            parsed = self._parse_json_content(content)
+            style = str(parsed.get("style") or "technical")
+            if style not in {"technical", "non_technical", "mixed"}:
+                style = "technical"
+            return AIReplyStyleDecision(style=style, reason=str(parsed.get("reason") or ""))
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise AIProviderError(f"Could not parse AI reply style response: {content}") from exc
+
     def draft_reply(self, candidate: FeedCandidate, context: dict[str, Any] | None = None) -> AIDraftResult:
+        reply_style = str(context.get("reply_style") or "") if isinstance(context, dict) else ""
         system = (
             "Draft one short technical Twitter reply under 100 chars. "
             "Write like a sharp practitioner, not a summarizer. Lead with a judgment, useful angle, or tension. "
@@ -307,8 +365,26 @@ class OpenAICompatibleProvider(BaseAIProvider):
             "Avoid generic praise, repetition, and restating the post. One or two short sentences. No lists. No emojis. "
             "Return JSON with text and rationale."
         )
-        user_payload: dict[str, Any] = {"candidate": candidate.model_dump(mode="json")}
-        if context:
+        if reply_style == "non_technical":
+            system = (
+                "Draft one short Twitter reply under 100 chars for a non-technical post. "
+                "Sound natural, relaxed, and human. Lead with a light observation, mild reaction, gentle humor, or easy empathy. "
+                "Do not force technical jargon, engineering framing, or heavy analysis onto the post. "
+                "Keep it conversational and plainspoken. One or two short sentences. Prefer statements over questions. No lists. No emojis. Return JSON with text and rationale."
+            )
+        elif reply_style == "mixed":
+            system = (
+                "Draft one short Twitter reply under 100 chars for a mixed technical and casual post. "
+                "Keep it natural and human, with one light judgment or observation. Use plain language and avoid heavy technical framing unless the post clearly invites it. "
+                "One or two short sentences. Prefer statements over questions. No lists. No emojis. Return JSON with text and rationale."
+            )
+        user_payload: dict[str, Any] = {
+            "candidate": _compact_candidate_payload(
+                candidate.model_dump(mode="json"),
+                include_media_types=True,
+            )
+        }
+        if context and any(key != "reply_style" for key in context):
             system = (
                 "Draft one short technical Twitter reply under 100 chars. "
                 "First acknowledge the valid point in the post, then add a fuller angle from the surrounding context. "

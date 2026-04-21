@@ -1,6 +1,6 @@
 [project]
 name = "x-atuo"
-version = "0.2.0"
+version = "0.3.0"
 description = "Webhook and scheduled Twitter automation service built on Agent Reach patterns."
 readme = "README.md"
 requires-python = ">=3.11"
