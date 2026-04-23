@@ -1,4 +1,4 @@
-"""Low-level twitter-cli wrapper for deterministic service use."""
+"""Low-level twitter-cli wrapper for automation service use."""
 
 from __future__ import annotations
 

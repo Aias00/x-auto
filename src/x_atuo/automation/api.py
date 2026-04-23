@@ -15,12 +15,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 from x_atuo.automation.config import AutomationConfig
 from x_atuo.automation.observability import LangfuseRuntime, build_langfuse_runtime
 from x_atuo.automation.schemas import (
-    FeedEngageRequest,
-    DirectPostRequest,
     HealthResponse,
-    RepoPostRequest,
     RunLookupResponse,
-    WebhookAcceptedResponse,
 )
 from x_atuo.automation.scheduler import AutomationScheduler, ScheduledWorkflow
 from x_atuo.automation.state import AutomationRequest, FeedOptions, WorkflowKind
@@ -56,6 +52,7 @@ async def _execute_job(
     function_name: str,
     payload: dict[str, Any],
     requested_job_id: str | None,
+    request_obj: AutomationRequest | None = None,
     observability_runtime: Any | None = None,
 ) -> dict[str, Any]:
     run_id = str(uuid4())
@@ -81,17 +78,33 @@ async def _execute_job(
     storage.update_run(run_id, status="running", started_at=utcnow())
 
     try:
-        result = await _call_graph(
-            function_name,
-            run_id=run_id,
-            job_id=job_id,
-            endpoint=endpoint,
-            payload=payload,
-            storage=storage,
-            observability_runtime=observability_runtime,
-        )
+        if request_obj is not None:
+            request_for_run = request_obj.model_copy(update={"run_id": run_id, "job_name": job_id})
+            proxy = request_for_run.metadata.get("proxy") if isinstance(request_for_run.metadata, dict) else None
+            result = await _run_request(
+                request_for_run,
+                storage=storage,
+                endpoint=endpoint,
+                proxy=proxy,
+                observability_runtime=observability_runtime,
+            )
+        else:
+            result = await _call_graph(
+                function_name,
+                run_id=run_id,
+                job_id=job_id,
+                endpoint=endpoint,
+                payload=payload,
+                storage=storage,
+                observability_runtime=observability_runtime,
+            )
         normalized_result = _normalize_result(result)
         run_status = _derive_status(normalized_result)
+        error_message = _derive_error_message(
+            normalized_result,
+            run_status=run_status,
+            current_error=error_message,
+        )
     except Exception as exc:
         error_message = str(exc)
         normalized_result = {"status": "failed", "error": error_message}
@@ -133,6 +146,7 @@ async def _dispatch_scheduled_request(
         function_name=function_name,
         payload=payload,
         requested_job_id=request_obj.job_name,
+        request_obj=request_obj,
         observability_runtime=observability_runtime,
     )
 
@@ -191,14 +205,16 @@ def _build_scheduled_feed_engage(settings: AutomationConfig) -> ScheduledWorkflo
             trigger_args["day"] = settings.scheduler.feed_engage_day
         if settings.scheduler.feed_engage_day_of_week is not None:
             trigger_args["day_of_week"] = settings.scheduler.feed_engage_day_of_week
-    defaults = FeedEngageRequest()
     request_obj = AutomationRequest.for_feed_engage(
         job_name="scheduled-feed-engage",
-        dry_run=defaults.dry_run,
-        approval_mode=defaults.mode,
-        reply_text=defaults.reply_template,
-        feed_options=FeedOptions(feed_type=defaults.feed_type, feed_count=defaults.feed_count),
-        metadata={"proxy": defaults.proxy, "trigger": "scheduler"},
+        dry_run=False,
+        approval_mode="ai_auto",
+        reply_text=None,
+        feed_options=FeedOptions(
+            feed_type=settings.twitter.default_feed_type,
+            feed_count=settings.twitter.default_feed_count,
+        ),
+        metadata={"proxy": settings.twitter.proxy_url, "trigger": "scheduler"},
     )
     return ScheduledWorkflow(
         job_id="scheduled-feed-engage",
@@ -438,45 +454,16 @@ def _derive_status(result: Any) -> str:
     return "completed"
 
 
-async def _execute_webhook(
-    *,
-    request: Request,
-    endpoint: str,
-    job_type: str,
-    function_name: str,
-    payload: dict[str, Any],
-    requested_job_id: str | None,
-) -> WebhookAcceptedResponse:
-    accepted_at = datetime.now(timezone.utc)
-    storage = get_storage(request)
-    observability_runtime = getattr(request.app.state, "observability_runtime", None)
-
-    try:
-        record = await _execute_job(
-            storage=storage,
-            endpoint=endpoint,
-            job_type=job_type,
-            function_name=function_name,
-            payload=payload,
-            requested_job_id=requested_job_id,
-            observability_runtime=observability_runtime,
-        )
-        return WebhookAcceptedResponse(
-            run_id=record["run_id"],
-            job_id=record["job_id"],
-            job_type=job_type,
-            endpoint=endpoint,
-            status=record["status"],
-            accepted_at=accepted_at,
-            result=record["result"],
-        )
-    except HTTPException as exc:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="orchestration failed",
-        ) from exc
+def _derive_error_message(result: Any, *, run_status: str, current_error: str | None) -> str | None:
+    if current_error is not None:
+        return current_error
+    if run_status != "blocked" or not isinstance(result, dict):
+        return None
+    errors = result.get("errors")
+    if not isinstance(errors, list):
+        return None
+    messages = [str(item).strip() for item in errors if str(item).strip()]
+    return messages[0] if messages else None
 
 
 @app.get("/healthz", response_model=HealthResponse)
@@ -491,51 +478,3 @@ async def get_run(run_id: str, request: Request) -> RunLookupResponse:
     if run_payload is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
     return RunLookupResponse(**run_payload)
-
-
-@app.post(
-    "/hooks/twitter/feed-engage",
-    response_model=WebhookAcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def feed_engage(payload: FeedEngageRequest, request: Request) -> WebhookAcceptedResponse:
-    return await _execute_webhook(
-        request=request,
-        endpoint="/hooks/twitter/feed-engage",
-        job_type="feed_engage",
-        function_name="run_feed_engage",
-        payload=payload.model_dump(mode="json", exclude_none=True),
-        requested_job_id=payload.job_id,
-    )
-
-
-@app.post(
-    "/hooks/twitter/repo-post",
-    response_model=WebhookAcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def repo_post(payload: RepoPostRequest, request: Request) -> WebhookAcceptedResponse:
-    return await _execute_webhook(
-        request=request,
-        endpoint="/hooks/twitter/repo-post",
-        job_type="repo_post",
-        function_name="run_repo_post",
-        payload=payload.model_dump(mode="json", exclude_none=True),
-        requested_job_id=payload.job_id,
-    )
-
-
-@app.post(
-    "/hooks/twitter/direct-post",
-    response_model=WebhookAcceptedResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def direct_post(payload: DirectPostRequest, request: Request) -> WebhookAcceptedResponse:
-    return await _execute_webhook(
-        request=request,
-        endpoint="/hooks/twitter/direct-post",
-        job_type="direct_post",
-        function_name="run_direct_post",
-        payload=payload.model_dump(mode="json", exclude_none=True),
-        requested_job_id=payload.job_id,
-    )

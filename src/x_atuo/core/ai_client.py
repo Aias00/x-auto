@@ -10,7 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from x_atuo.automation.config import AISettings
-from x_atuo.automation.state import FeedCandidate, RepoContext
+from x_atuo.automation.state import FeedCandidate
 
 
 class AIProviderError(RuntimeError):
@@ -56,9 +56,6 @@ class BaseAIProvider:
     def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
         raise NotImplementedError
 
-    def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
-        raise NotImplementedError
-
 
 def _compact_candidate_payload(
     candidate_payload: dict[str, Any],
@@ -93,7 +90,7 @@ def _compact_candidate_payload(
 
 
 class MockAIProvider(BaseAIProvider):
-    """Deterministic provider for local testing and fallback demos."""
+    """Mock provider for local testing and local AI-shaped flows."""
 
     def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
         if not candidates:
@@ -124,19 +121,6 @@ class MockAIProvider(BaseAIProvider):
 
     def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
         return AIReplyStyleDecision(style="technical", reason="mock provider default")
-
-    def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
-        repo_name = context.repo_name or context.repo_url
-        desc = context.description or context.readme_excerpt or "Open-source repository"
-        text = (
-            f"{repo_name}: {desc.rstrip('.')}.\n\n"
-            f"Link: {context.repo_url}\n#OpenSource #GitHub #DevTools"
-        )
-        return AIDraftResult(
-            text=text[:180],
-            rationale="mock provider generated a shorter repository summary",
-        )
-
 
 class OpenAICompatibleProvider(BaseAIProvider):
     """Simple OpenAI-compatible chat completions provider via stdlib HTTP."""
@@ -275,18 +259,6 @@ class OpenAICompatibleProvider(BaseAIProvider):
             return AIDraftResult(text=str(parsed["text"]), rationale=str(parsed.get("rationale") or ""))
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise AIProviderError(f"Could not parse AI draft response: {content}") from exc
-
-    def draft_repo_post(self, context: RepoContext) -> AIDraftResult:
-        content = self._chat(
-            "Draft one short repository recommendation tweet under 160 chars. Keep it simple and direct. Return JSON with text and rationale.",
-            json.dumps(context.model_dump(mode="json"), ensure_ascii=False),
-        )
-        try:
-            parsed = self._parse_json_content(content)
-            return AIDraftResult(text=str(parsed["text"]), rationale=str(parsed.get("rationale") or ""))
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"Could not parse AI draft response: {content}") from exc
-
 
 def build_ai_provider(settings: AISettings) -> BaseAIProvider | None:
     if settings.provider == "none":

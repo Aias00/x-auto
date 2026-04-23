@@ -20,8 +20,6 @@ class WorkflowKind(str, Enum):
     """Supported workflow types."""
 
     FEED_ENGAGE = "feed-engage"
-    REPO_POST = "repo-post"
-    DIRECT_POST = "direct-post"
 
 
 class RunStatus(str, Enum):
@@ -55,19 +53,8 @@ class FeedCandidate(BaseModel):
 class FeedOptions(BaseModel):
     """Inputs for live feed fetching."""
 
-    feed_type: str = "following"
-    feed_count: int = 20
-
-
-class RepoContext(BaseModel):
-    """Minimal repo context used by repo-post workflows."""
-
-    repo_url: str
-    repo_name: str | None = None
-    description: str | None = None
-    readme_excerpt: str | None = None
-    stars: int | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    feed_type: str = "for-you"
+    feed_count: int = 10
 
 
 class PolicyDecision(BaseModel):
@@ -109,28 +96,21 @@ class AutomationRequest(BaseModel):
     workflow: WorkflowKind
     job_name: str | None = None
     run_id: str | None = None
-    dry_run: bool = True
-    approval_mode: str = "deterministic"
+    dry_run: bool = False
+    approval_mode: str = "ai_auto"
     idempotency_key: str | None = None
     reply_text: str | None = None
-    candidate: FeedCandidate | None = None
-    candidates: list[FeedCandidate] = Field(default_factory=list)
     feed_options: FeedOptions | None = None
-    repo_url: str | None = None
-    post_text: str | None = None
-    media_paths: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_for_workflow(self) -> "AutomationRequest":
         """Enforce workflow-specific payload requirements."""
 
-        if self.workflow is WorkflowKind.FEED_ENGAGE and self.feed_options is None:
-            self.feed_options = FeedOptions()
-        if self.workflow is WorkflowKind.REPO_POST and not self.repo_url:
-            raise ValueError("repo-post requires repo_url")
-        if self.workflow is WorkflowKind.DIRECT_POST and not self.post_text:
-            raise ValueError("direct-post requires post_text")
+        if self.workflow is WorkflowKind.FEED_ENGAGE:
+            self.approval_mode = "ai_auto"
+            if self.feed_options is None:
+                self.feed_options = FeedOptions()
         return self
 
     @classmethod
@@ -138,41 +118,13 @@ class AutomationRequest(BaseModel):
         cls,
         *,
         reply_text: str | None = None,
-        candidate: FeedCandidate | None = None,
-        candidates: list[FeedCandidate] | None = None,
         feed_options: FeedOptions | None = None,
         **kwargs: Any,
     ) -> "AutomationRequest":
         return cls(
             workflow=WorkflowKind.FEED_ENGAGE,
             reply_text=reply_text,
-            candidate=candidate,
-            candidates=candidates or [],
             feed_options=feed_options or FeedOptions(),
-            **kwargs,
-        )
-
-    @classmethod
-    def for_repo_post(cls, *, repo_url: str, post_text: str | None = None, **kwargs: Any) -> "AutomationRequest":
-        return cls(
-            workflow=WorkflowKind.REPO_POST,
-            repo_url=repo_url,
-            post_text=post_text,
-            **kwargs,
-        )
-
-    @classmethod
-    def for_direct_post(
-        cls,
-        *,
-        post_text: str,
-        media_paths: list[str] | None = None,
-        **kwargs: Any,
-    ) -> "AutomationRequest":
-        return cls(
-            workflow=WorkflowKind.DIRECT_POST,
-            post_text=post_text,
-            media_paths=media_paths or [],
             **kwargs,
         )
 
@@ -191,7 +143,6 @@ class WorkflowStateModel(BaseModel):
     selected_candidate: FeedCandidate | None = None
     selection_source: str | None = None
     selection_reason: str | None = None
-    repo_context: RepoContext | None = None
     reply_context: dict[str, Any] = Field(default_factory=dict)
     rendered_text: str | None = None
     drafting_source: str | None = None

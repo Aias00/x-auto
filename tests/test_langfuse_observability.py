@@ -208,8 +208,8 @@ def test_langfuse_runtime_finishes_workflow_observation_via_context_manager_exit
     )
 
     workflow_observation = runtime.start_workflow_observation(
-        run_name="x-atuo.direct-post",
-        metadata={"workflow": "direct-post"},
+        run_name="x-atuo.feed-engage",
+        metadata={"workflow": "feed-engage"},
     )
 
     runtime.finish_workflow_observation(
@@ -231,7 +231,7 @@ def test_langfuse_runtime_finishes_workflow_observation_via_context_manager_exit
 
 def test_automation_graph_invoke_passes_graph_config() -> None:
     graph = AutomationGraph(AutomationConfig())
-    request = AutomationRequest.for_direct_post(post_text="hello")
+    request = AutomationRequest.for_feed_engage(reply_text="hello")
     captured: dict[str, object] = {}
 
     async def fake_ainvoke(state, config=None):
@@ -246,7 +246,7 @@ def test_automation_graph_invoke_passes_graph_config() -> None:
 
 
 def test_api_run_request_continues_without_langfuse(monkeypatch) -> None:
-    request = AutomationRequest.for_direct_post(post_text="hello")
+    request = AutomationRequest.for_feed_engage(reply_text="hello")
     storage = object()
     captured: dict[str, object] = {}
 
@@ -283,7 +283,7 @@ def test_api_run_request_continues_without_langfuse(monkeypatch) -> None:
         automation_api._run_request(
             request,
             storage=storage,
-            endpoint="/hooks/twitter/direct-post",
+            endpoint="scheduler:feed-engage",
         )
     )
 
@@ -297,12 +297,12 @@ def test_api_run_request_continues_without_langfuse(monkeypatch) -> None:
 
 
 def test_api_run_request_uses_provided_observability_runtime(monkeypatch) -> None:
-    request = AutomationRequest.for_direct_post(
-        post_text="hello",
+    request = AutomationRequest.for_feed_engage(
+        reply_text="hello",
         run_id="run-123",
         job_name="job-123",
         dry_run=True,
-        approval_mode="human_review",
+        approval_mode="ai_auto",
     )
     storage = object()
     calls: dict[str, object] = {}
@@ -357,7 +357,7 @@ def test_api_run_request_uses_provided_observability_runtime(monkeypatch) -> Non
         automation_api._run_request(
             request,
             storage=storage,
-            endpoint="/hooks/twitter/direct-post",
+            endpoint="scheduler:feed-engage",
             observability_runtime=FakeRuntime(),
         )
     )
@@ -365,22 +365,22 @@ def test_api_run_request_uses_provided_observability_runtime(monkeypatch) -> Non
     assert result["status"] == "completed"
     assert calls["request"] is request
     assert calls["start"] == {
-        "run_name": "x-atuo.direct-post",
+        "run_name": "x-atuo.feed-engage",
         "metadata": {
             "run_id": "run-123",
             "job_id": "job-123",
-            "workflow": "direct-post",
-            "endpoint": "/hooks/twitter/direct-post",
+            "workflow": "feed-engage",
+            "endpoint": "scheduler:feed-engage",
             "dry_run": True,
-            "approval_mode": "human_review",
+            "approval_mode": "ai_auto",
             "environment": "development",
         },
     }
     assert calls["build"] == {
-        "run_name": "x-atuo.direct-post",
+        "run_name": "x-atuo.feed-engage",
         "observation": "observation",
     }
-    assert calls["graph_config"] == {"callbacks": ["cb"], "run_name": "x-atuo.direct-post"}
+    assert calls["graph_config"] == {"callbacks": ["cb"], "run_name": "x-atuo.feed-engage"}
     assert calls["finish"] == {
         "observation": "observation",
         "output": {"status": "completed", "run_id": "run-123"},
@@ -391,8 +391,8 @@ def test_api_run_request_uses_provided_observability_runtime(monkeypatch) -> Non
 
 
 def test_api_run_request_marks_failed_snapshot_for_observability(monkeypatch) -> None:
-    request = AutomationRequest.for_direct_post(
-        post_text="hello",
+    request = AutomationRequest.for_feed_engage(
+        reply_text="hello",
         run_id="run-failed",
         job_name="job-failed",
     )
@@ -446,7 +446,7 @@ def test_api_run_request_marks_failed_snapshot_for_observability(monkeypatch) ->
         automation_api._run_request(
             request,
             storage=storage,
-            endpoint="/hooks/twitter/direct-post",
+            endpoint="scheduler:feed-engage",
             observability_runtime=FakeRuntime(),
         )
     )
@@ -491,160 +491,36 @@ def test_graph_build_request_binding_for_feed_engage_uses_feed_options_and_proxy
     assert request.job_name == "job-feed"
     assert request.run_id == "run-feed"
     assert request.dry_run is True
-    assert request.approval_mode == "human_review"
+    assert request.approval_mode == "ai_auto"
     assert request.reply_text == "Ship it"
     assert request.feed_options is not None
     assert request.feed_options.feed_type == "following"
     assert request.feed_options.feed_count == 7
-    assert request.candidate is not None
-    assert request.candidate.tweet_id == "tweet-1"
-    assert len(request.candidates) == 1
-    assert request.candidates[0].tweet_id == "tweet-2"
+    assert "candidate" not in request.model_dump(mode="json")
+    assert "candidates" not in request.model_dump(mode="json")
     assert request.metadata == {"source": "webhook"}
     assert request.idempotency_key == "idem-1"
     assert proxy == "http://proxy.example:8080"
 
 
-def test_direct_post_webhook_uses_app_lifecycle_runtime(monkeypatch) -> None:
-    calls: dict[str, object] = {}
-    runtime = SimpleNamespace()
+def test_graph_build_request_binding_uses_scheduler_production_defaults_when_values_omitted() -> None:
+    request, proxy = automation_graph.build_request_binding(
+        "run_feed_engage",
+        run_id="run-defaults",
+        job_id="job-defaults",
+        payload={},
+    ) or (None, None)
 
-    snapshot = SimpleNamespace(
-        status=SimpleNamespace(value="completed"),
-        run_id="run-webhook",
-        result=None,
-        candidate_refresh_count=0,
-        selected_candidate=None,
-        rendered_text="hello from webhook",
-        selection_source=None,
-        selection_reason=None,
-        drafting_source="rule",
-        errors=[],
-        events=[],
-    )
+    config = AutomationConfig()
 
-    class FakeStorage:
-        def __init__(self, path):
-            self.path = path
-
-        def initialize(self) -> None:
-            pass
-
-        def clear_stale_running_runs(self, *, reason: str) -> None:
-            pass
-
-        def upsert_job(self, job_id: str, job_type: str, config: dict[str, object]) -> None:
-            calls["upsert_job"] = (job_id, job_type, config)
-
-        def create_run(self, **kwargs) -> None:
-            calls["create_run"] = kwargs
-
-        def add_audit_event(self, **kwargs) -> None:
-            calls.setdefault("audit_events", []).append(kwargs)
-
-        def update_run(self, run_id: str, **kwargs) -> None:
-            calls.setdefault("update_run", []).append((run_id, kwargs))
-
-    class FakeScheduler:
-        def __init__(self, config, dispatcher, on_queue_full):
-            self.config = config
-            self.dispatcher = dispatcher
-            self.on_queue_full = on_queue_full
-
-        def register_job(self, definition) -> None:
-            raise AssertionError("unexpected scheduler registration")
-
-        def maybe_start(self) -> None:
-            calls["scheduler_started"] = True
-
-        def shutdown(self, *, wait: bool) -> None:
-            calls["scheduler_shutdown"] = wait
-
-    class FakeGraph:
-        async def invoke(self, graph_request, graph_config=None):
-            calls["request"] = graph_request
-            calls["graph_config"] = graph_config
-            return snapshot
-
-    fake_module = SimpleNamespace(
-        build_request_binding=automation_graph.build_request_binding,
-        _build_runtime_graph=lambda config, graph_storage, proxy=None: FakeGraph(),
-        _persist_snapshot=lambda graph_storage, graph_snapshot: calls.update(
-            persisted_storage=graph_storage,
-            persisted_snapshot=graph_snapshot,
-        ),
-    )
-
-    def start_workflow_observation(**kwargs):
-        calls["start"] = kwargs
-        return "webhook-observation"
-
-    def build_graph_config(*, run_name, observation=None):
-        calls["build"] = {"run_name": run_name, "observation": observation}
-        return {"callbacks": ["cb"], "run_name": run_name}
-
-    def finish_workflow_observation(observation, *, output=None, error=None):
-        calls["finish"] = {
-            "observation": observation,
-            "output": output,
-            "error": error,
-        }
-
-    def shutdown() -> None:
-        calls["runtime_shutdown"] = calls.get("runtime_shutdown", 0) + 1
-
-    runtime.start_workflow_observation = start_workflow_observation
-    runtime.build_graph_config = build_graph_config
-    runtime.finish_workflow_observation = finish_workflow_observation
-    runtime.shutdown = shutdown
-
-    monkeypatch.setattr(automation_api, "AutomationStorage", FakeStorage)
-    monkeypatch.setattr(automation_api, "AutomationScheduler", FakeScheduler)
-    monkeypatch.setattr(automation_api, "_build_scheduled_feed_engage", lambda settings: None)
-    monkeypatch.setattr(automation_api, "build_langfuse_runtime", lambda settings: runtime)
-    monkeypatch.setattr(automation_api, "_load_graph_module", lambda: fake_module)
-    monkeypatch.setattr(automation_api, "uuid4", lambda: "run-webhook")
-
-    with TestClient(automation_api.app) as client:
-        assert automation_api.app.state.observability_runtime is runtime
-        response = client.post(
-            "/hooks/twitter/direct-post",
-            json={
-                "job_id": "job-webhook",
-                "mode": "ai_auto",
-                "dry_run": True,
-                "text": "hello from webhook",
-                "metadata": {},
-                "images": [],
-            },
-        )
-
-    assert response.status_code == 202
-    assert response.json()["endpoint"] == "/hooks/twitter/direct-post"
-    assert calls["start"] == {
-        "run_name": "x-atuo.direct-post",
-        "metadata": {
-            "run_id": "run-webhook",
-            "job_id": "job-webhook",
-            "workflow": "direct-post",
-            "endpoint": "/hooks/twitter/direct-post",
-            "dry_run": True,
-            "approval_mode": "ai_auto",
-            "environment": "development",
-        },
-    }
-    assert calls["build"] == {
-        "run_name": "x-atuo.direct-post",
-        "observation": "webhook-observation",
-    }
-    assert calls["graph_config"] == {"callbacks": ["cb"], "run_name": "x-atuo.direct-post"}
-    assert calls["persisted_snapshot"] is snapshot
-    assert calls["finish"] == {
-        "observation": "webhook-observation",
-        "output": {"status": "completed", "run_id": "run-webhook"},
-        "error": None,
-    }
-    assert calls["runtime_shutdown"] == 1
+    assert request is not None
+    assert request.workflow.value == "feed-engage"
+    assert request.dry_run is False
+    assert request.approval_mode == "ai_auto"
+    assert request.feed_options is not None
+    assert request.feed_options.feed_type == config.twitter.default_feed_type
+    assert request.feed_options.feed_count == config.twitter.default_feed_count
+    assert proxy == config.twitter.proxy_url
 
 
 def test_lifespan_stores_and_shuts_down_observability_runtime(monkeypatch) -> None:

@@ -39,9 +39,9 @@ def build_dedupe_key(
         [
             request.workflow.value,
             request.job_name or "",
-            candidate.tweet_id if candidate else request.repo_url or "",
+            candidate.tweet_id if candidate else "",
             candidate.screen_name or "" if candidate else "",
-            (text or request.reply_text or request.post_text or "").strip(),
+            (text or request.reply_text or "").strip(),
         ]
     )
     digest = sha256(seed.encode("utf-8")).hexdigest()[:20]
@@ -112,12 +112,11 @@ def evaluate_policy(
     hooks: PolicyHooks | None = None,
     now: datetime | None = None,
 ) -> PolicyDecision:
-    """Run the basic deterministic policy checks for a workflow."""
+    """Run the basic policy checks for a workflow."""
 
     decisions: list[PolicyDecision] = []
     now = now or datetime.now(UTC)
-    limit = config.max_reply_length if request.workflow is WorkflowKind.FEED_ENGAGE else config.max_post_length
-    decisions.append(check_text_length(text, limit=limit))
+    decisions.append(check_text_length(text, limit=config.max_reply_length))
 
     dedupe_key = build_dedupe_key(request, candidate=candidate, text=text)
     dedupe = PolicyDecision(dedupe_key=dedupe_key)

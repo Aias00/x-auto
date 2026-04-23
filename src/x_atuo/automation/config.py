@@ -32,7 +32,7 @@ class AISettings(BaseModel):
 
 
 class PolicyConfig(BaseModel):
-    """Deterministic automation safeguards."""
+    """Automation safeguards."""
 
     max_post_length: int = 280
     max_reply_length: int = 280
@@ -73,7 +73,7 @@ class JobConfig(BaseModel):
     schedule: str | None = None
     timezone: str | None = None
     dry_run: bool | None = None
-    approval_mode: str = "deterministic"
+    approval_mode: str = "ai_auto"
     payload_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
