@@ -13,6 +13,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 class TwitterRuntimeConfig(BaseModel):
     """Settings used by Twitter-facing automation runners."""
 
+    cli_bin: str = "twitter"
     proxy_url: str | None = "http://127.0.0.1:7890"
     auth_token_env: str = "TWITTER_AUTH_TOKEN"
     ct0_env: str = "TWITTER_CT0"

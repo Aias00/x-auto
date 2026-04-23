@@ -44,6 +44,10 @@ class FeedCandidate(BaseModel):
     created_at: datetime | None = None
     url: str | None = None
     author_verified: bool | None = None
+    can_reply: bool | None = None
+    reply_limit_reason: str | None = None
+    reply_limit_headline: str | None = None
+    reply_restriction_policy: str | None = None
     score: float | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 

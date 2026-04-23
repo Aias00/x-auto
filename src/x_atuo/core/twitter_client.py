@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import urllib.parse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -74,7 +76,7 @@ class TwitterClient:
                 raise ValueError(f"Unexpected config shape in {config_file}")
             data = loaded
         return cls(
-            twitter_bin=twitter_bin,
+            twitter_bin=str(twitter_bin),
             credentials=TwitterCredentials(
                 auth_token=str(data.get("twitter_auth_token") or env.get("TWITTER_AUTH_TOKEN") or ""),
                 ct0=str(data.get("twitter_ct0") or env.get("TWITTER_CT0") or ""),
@@ -147,7 +149,7 @@ class TwitterClient:
         tweet = tweets[0]
         if not tweet.tweet_id:
             raise TwitterClientError(f"Invalid tweet payload returned for {tweet_id}")
-        return tweet
+        return self._enrich_tweet_reply_state(tweet)
 
     def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5) -> tuple[TweetRecord, list[TweetRecord]]:
         if max_replies < 0:
@@ -156,7 +158,7 @@ class TwitterClient:
         tweets = self._parse_tweets(payload)
         if not tweets:
             raise TwitterClientError(f"No tweet thread returned for {tweet_id}")
-        return tweets[0], tweets[1:]
+        return self._enrich_tweet_reply_state(tweets[0]), tweets[1:]
 
     def fetch_user_profile(self, screen_name: str) -> dict[str, object]:
         payload = self._run_json(["user", screen_name]).payload
@@ -188,6 +190,51 @@ class TwitterClient:
         if not tweets:
             raise TwitterClientError(f"No user posts returned for {screen_name}")
         return tweets
+
+    def _enrich_tweet_reply_state(self, tweet: TweetRecord) -> TweetRecord:
+        if not tweet.tweet_id or tweet.can_reply is not None or not self.credentials.ok:
+            return tweet
+        try:
+            detail_payload = self._fetch_tweet_detail_payload(tweet.tweet_id)
+        except Exception:
+            return tweet
+        reply_state = _extract_reply_state_from_detail_payload(detail_payload, tweet.tweet_id)
+        reply_policy = _extract_reply_control_policy_from_detail_payload(detail_payload, tweet.tweet_id)
+        if reply_state is None and reply_policy is None:
+            return tweet
+        can_reply, reply_limit_headline, reply_limit_reason = reply_state or (tweet.can_reply, tweet.reply_limit_headline, tweet.reply_limit_reason)
+        raw = dict(tweet.raw) if isinstance(tweet.raw, dict) else {}
+        if can_reply is not None:
+            raw["canReply"] = can_reply
+        if reply_limit_headline is not None:
+            raw["replyLimitHeadline"] = reply_limit_headline
+        if reply_limit_reason is not None:
+            raw["replyLimitReason"] = reply_limit_reason
+        if reply_policy is not None:
+            raw["replyRestrictionPolicy"] = reply_policy
+        return replace(
+            tweet,
+            can_reply=can_reply,
+            reply_limit_headline=reply_limit_headline,
+            reply_limit_reason=reply_limit_reason,
+            reply_restriction_policy=reply_policy,
+            raw=raw,
+        )
+
+    def _fetch_tweet_detail_payload(self, tweet_id: str) -> dict[str, Any]:
+        url = _build_tweet_detail_url(tweet_id)
+        headers = _build_twitter_headers(self.credentials)
+        request = Request(url, headers=headers, method="GET")
+        if self.proxy:
+            opener = build_opener(ProxyHandler({"http": self.proxy, "https": self.proxy}))
+            response = opener.open(request, timeout=self.timeout)
+        else:
+            response = urlopen(request, timeout=self.timeout)
+        with response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise TwitterClientError(f"Unexpected tweet detail payload type: {type(payload)!r}")
+        return payload
 
     def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
         execution = self._run_json(["reply", tweet_id, text], allow_error_payload=True)
@@ -356,3 +403,176 @@ class TwitterClient:
             if candidate not in (None, ""):
                 return str(candidate)
         return None
+
+
+_TWITTER_BEARER_TOKEN = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
+    "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+_TWEET_DETAIL_QUERY_ID = "xIYgDwjboktoFeXe_fgacw"
+_TWEET_DETAIL_FEATURES = {
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "tweetypie_unmention_optimization_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "responsive_web_media_download_video_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+_TWEET_DETAIL_FIELD_TOGGLES = {
+    "withArticleRichContentState": True,
+    "withArticlePlainText": False,
+    "withGrokAnalyze": False,
+    "withDisallowedReplyControls": False,
+}
+
+
+def _build_tweet_detail_url(tweet_id: str) -> str:
+    variables = {
+        "focalTweetId": tweet_id,
+        "referrer": "tweet",
+        "with_rux_injections": False,
+        "includePromotedContent": True,
+        "rankingMode": "Relevance",
+        "withCommunity": True,
+        "withQuickPromoteEligibilityTweetFields": True,
+        "withBirdwatchNotes": True,
+        "withVoice": True,
+    }
+    compact_features = {key: value for key, value in _TWEET_DETAIL_FEATURES.items() if value is not False}
+    return (
+        f"https://x.com/i/api/graphql/{_TWEET_DETAIL_QUERY_ID}/TweetDetail"
+        f"?variables={urllib.parse.quote(json.dumps(variables, separators=(",", ":")))}"
+        f"&features={urllib.parse.quote(json.dumps(compact_features, separators=(",", ":")))}"
+        f"&fieldToggles={urllib.parse.quote(json.dumps(_TWEET_DETAIL_FIELD_TOGGLES, separators=(",", ":")))}"
+    )
+
+
+def _build_twitter_headers(credentials: TwitterCredentials) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {_TWITTER_BEARER_TOKEN}",
+        "Cookie": f"auth_token={credentials.auth_token}; ct0={credentials.ct0}",
+        "X-Csrf-Token": credentials.ct0,
+        "X-Twitter-Active-User": "yes",
+        "X-Twitter-Auth-Type": "OAuth2Session",
+        "X-Twitter-Client-Language": "en",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/133.0.0.0 Safari/537.36"
+        ),
+        "Origin": "https://x.com",
+        "Referer": "https://x.com/",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+
+def _extract_reply_state_from_detail_payload(payload: dict[str, Any], tweet_id: str) -> tuple[bool | None, str | None, str | None] | None:
+    tweet_id = str(tweet_id)
+    for item in _walk_mappings(payload):
+        if not _matches_tweet_id(item, tweet_id):
+            continue
+        return _derive_reply_state_from_result(item)
+    return None
+
+
+def _extract_reply_control_policy_from_detail_payload(payload: dict[str, Any], tweet_id: str) -> str | None:
+    tweet_id = str(tweet_id)
+    for item in _walk_mappings(payload):
+        if not _matches_tweet_id(item, tweet_id):
+            continue
+        return _extract_reply_control_policy(item)
+    return None
+
+
+def _derive_reply_state_from_result(result: dict[str, Any]) -> tuple[bool | None, str | None, str | None] | None:
+    limited_action_results = result.get("limitedActionResults")
+    if "limitedActionResults" in result:
+        if not isinstance(limited_action_results, dict):
+            return True, None, None
+        limited_actions = limited_action_results.get("limited_actions")
+        if not isinstance(limited_actions, list):
+            return True, None, None
+        for action in limited_actions:
+            if not isinstance(action, dict) or action.get("action") != "Reply":
+                continue
+            prompt = action.get("prompt")
+            if not isinstance(prompt, dict):
+                return False, None, None
+            headline = _deep_get(prompt, "headline", "text")
+            reason = _deep_get(prompt, "subtext", "text")
+            return (
+                False,
+                str(headline).strip() if isinstance(headline, str) and headline.strip() else None,
+                str(reason).strip() if isinstance(reason, str) and reason.strip() else None,
+            )
+        return True, None, None
+
+    return None
+
+
+def _walk_mappings(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _walk_mappings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk_mappings(nested)
+
+
+def _matches_tweet_id(item: dict[str, Any], tweet_id: str) -> bool:
+    wrapped = item.get("tweet") if isinstance(item.get("tweet"), dict) else None
+    candidate_ids = [
+        item.get("rest_id"),
+        item.get("id"),
+        _deep_get(item, "legacy", "id_str"),
+        wrapped.get("rest_id") if wrapped else None,
+        _deep_get(wrapped, "legacy", "id_str") if wrapped else None,
+    ]
+    return any(str(candidate) == tweet_id for candidate in candidate_ids if candidate not in (None, ""))
+
+
+def _extract_reply_control_policy(result: dict[str, Any]) -> str | None:
+    policy_candidates = [
+        _deep_get(result, "legacy", "conversation_control", "policy"),
+        _deep_get(result, "tweet", "legacy", "conversation_control", "policy"),
+    ]
+    for candidate in policy_candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _reply_control_reason(policy: str) -> str:
+    reasons = {
+        "ByInvitation": "Reply controls may limit who can respond.",
+        "Co": "Reply controls may limit who can respond.",
+    }
+    return reasons.get(policy, f"Conversation policy {policy} may limit who can reply.")
+
+
+def _deep_get(value: Any, *path: str) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current

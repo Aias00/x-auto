@@ -50,6 +50,7 @@ from x_atuo.core.github_repo_client import fetch_repo_context as fetch_github_re
 from x_atuo.core.github_repo_client import render_repo_post_text
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_engage_service import TwitterEngageService
+from x_atuo.core.twitter_client import _reply_control_reason
 from x_atuo.core.twitter_models import Candidate, TweetRecord
 
 StateCallable = Callable[[WorkflowStateModel], Any]
@@ -679,6 +680,16 @@ class AutomationGraph:
                     reason="author not verified",
                 )
                 continue
+            if candidate.can_reply is False:
+                removed_count += 1
+                snapshot.log_event(
+                    "prefilter_candidates",
+                    "candidate removed before selection",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    reason=(candidate.reply_limit_reason or candidate.reply_limit_headline or "reply restricted"),
+                )
+                continue
             if hooks is not None and hooks.has_target_tweet_id(candidate.tweet_id):
                 removed_count += 1
                 removed_already_engaged += 1
@@ -760,6 +771,13 @@ class AutomationGraph:
             elif snapshot.candidates:
                 snapshot.selected_candidate = snapshot.candidates[0]
         if snapshot.selected_candidate is None:
+            if snapshot.request.workflow is WorkflowKind.FEED_ENGAGE and not snapshot.candidates:
+                if self._schedule_candidate_refresh(
+                    snapshot,
+                    node="select_candidate",
+                    reason="no selectable candidates after hydration",
+                ):
+                    return {"snapshot": snapshot}
             snapshot.mark_failed("no candidate available for engagement", node="select_candidate")
         else:
             if snapshot.selection_source is None:
@@ -1225,7 +1243,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
     client = TwitterClient.from_config(
         config.agent_reach_config_path,
         proxy=proxy or config.twitter.proxy_url,
-        twitter_bin="twitter",
+        twitter_bin=config.twitter.cli_bin,
         timeout=120,
     )
     service = TwitterEngageService(client)
@@ -1273,6 +1291,10 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                         text=str(item.get("text") or "") or None,
                         created_at=created_at,
                         author_verified=metadata.get("author", {}).get("verified") if isinstance(metadata.get("author"), dict) else None,
+                        can_reply=item.get("can_reply", item.get("canReply")),
+                        reply_limit_reason=item.get("reply_limit_reason", item.get("replyLimitReason")),
+                        reply_limit_headline=item.get("reply_limit_headline", item.get("replyLimitHeadline")),
+                        reply_restriction_policy=item.get("reply_restriction_policy", item.get("replyRestrictionPolicy")),
                         metadata=metadata,
                     )
                 )
@@ -1292,6 +1314,10 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                 text=tweet.text,
                 created_at=getattr(tweet, "created_at", None),
                 author_verified=tweet.verified,
+                can_reply=getattr(tweet, "can_reply", None),
+                reply_limit_reason=getattr(tweet, "reply_limit_reason", None),
+                reply_limit_headline=getattr(tweet, "reply_limit_headline", None),
+                reply_restriction_policy=getattr(tweet, "reply_restriction_policy", None),
                 metadata=tweet.raw,
             )
             for tweet in tweets
@@ -1339,6 +1365,10 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         candidate.text = tweet.text or candidate.text
         candidate.created_at = getattr(tweet, "created_at", None) or candidate.created_at
         candidate.author_verified = tweet.verified
+        candidate.can_reply = getattr(tweet, "can_reply", None)
+        candidate.reply_limit_reason = getattr(tweet, "reply_limit_reason", None)
+        candidate.reply_limit_headline = getattr(tweet, "reply_limit_headline", None)
+        candidate.reply_restriction_policy = getattr(tweet, "reply_restriction_policy", None)
         candidate.metadata = build_hydrated_metadata(candidate, tweet)
         return candidate
 
@@ -1569,7 +1599,37 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             candidate.text = tweet.text or candidate.text
             candidate.created_at = getattr(tweet, "created_at", None) or candidate.created_at
             candidate.author_verified = tweet.verified
+            candidate.can_reply = getattr(tweet, "can_reply", None)
+            candidate.reply_limit_reason = getattr(tweet, "reply_limit_reason", None)
+            candidate.reply_limit_headline = getattr(tweet, "reply_limit_headline", None)
+            candidate.reply_restriction_policy = getattr(tweet, "reply_restriction_policy", None)
             candidate.metadata = build_hydrated_metadata(candidate, tweet)
+
+        allowed_candidates: list[FeedCandidate] = []
+        risky_candidates: list[FeedCandidate] = []
+        for candidate in snapshot.candidates:
+            if candidate.can_reply is False:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate removed after hydration",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    reason=(candidate.reply_limit_reason or candidate.reply_limit_headline or "reply restricted"),
+                )
+                continue
+            if candidate.reply_restriction_policy:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate de-prioritized after hydration",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    policy=candidate.reply_restriction_policy,
+                    reason=(candidate.reply_limit_reason or _reply_control_reason(candidate.reply_restriction_policy)),
+                )
+                risky_candidates.append(candidate)
+                continue
+            allowed_candidates.append(candidate)
+        snapshot.candidates = [*allowed_candidates, *risky_candidates]
         snapshot.stash_runtime_observability(
             "select_candidate",
             hydrated_count=len(snapshot.candidates),
@@ -1686,6 +1746,9 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                 text=candidate.text,
                 created_at=candidate.created_at,
                 author_verified=candidate.author_verified,
+                can_reply=candidate.can_reply,
+                reply_limit_reason=candidate.reply_limit_reason,
+                reply_limit_headline=candidate.reply_limit_headline,
                 metadata=candidate.metadata,
             )
         target_author = result.selected_candidate.screen_name if result.selected_candidate else None

@@ -35,6 +35,10 @@ class TweetRecord:
     text: str
     author: TweetAuthor
     created_at: datetime | None = None
+    can_reply: bool | None = None
+    reply_limit_reason: str | None = None
+    reply_limit_headline: str | None = None
+    reply_restriction_policy: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -51,6 +55,10 @@ class TweetRecord:
                 raw=dict(author) if isinstance(author, dict) else {},
             ),
             created_at=_parse_payload_datetime(payload),
+            can_reply=_coerce_optional_bool(payload.get("canReply", payload.get("can_reply"))),
+            reply_limit_reason=_coerce_optional_str(payload.get("replyLimitReason", payload.get("reply_limit_reason"))),
+            reply_limit_headline=_coerce_optional_str(payload.get("replyLimitHeadline", payload.get("reply_limit_headline"))),
+            reply_restriction_policy=_coerce_optional_str(payload.get("replyRestrictionPolicy", payload.get("reply_restriction_policy"))),
             raw=dict(payload),
         )
 
@@ -92,6 +100,19 @@ def _coerce_datetime(value: Any) -> datetime | None:
         return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
     except (TypeError, ValueError, IndexError):
         return None
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _coerce_optional_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
 
 
 @dataclass(slots=True, frozen=True)

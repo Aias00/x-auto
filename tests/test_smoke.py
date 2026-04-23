@@ -29,6 +29,8 @@ import x_atuo.automation.api as automation_api
 from x_atuo.core.ai_client import AIProviderError
 from x_atuo.core.ai_client import OpenAICompatibleProvider
 from x_atuo.core.ai_client import compose_reply_text
+from x_atuo.core.twitter_client import TwitterClient
+from x_atuo.core.twitter_client import TwitterCredentials
 from x_atuo.core.twitter_models import TweetRecord
 
 
@@ -115,6 +117,34 @@ def test_prefilter_candidates_filters_unverified_without_policy_hooks() -> None:
     )
 
 
+def test_prefilter_candidates_filters_reply_restricted_before_selection() -> None:
+    graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=None))
+    request = AutomationRequest.for_feed_engage(job_name="job")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.candidates = [
+        FeedCandidate(
+            tweet_id="111",
+            screen_name="limited",
+            text="candidate",
+            author_verified=True,
+            can_reply=False,
+            reply_limit_reason="Only some accounts can reply.",
+        ),
+        FeedCandidate(tweet_id="222", screen_name="open", text="candidate", author_verified=True, can_reply=True),
+    ]
+
+    result = asyncio.run(graph.prefilter_candidates(state))
+
+    assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["222"]
+    assert any(
+        event.node == "prefilter_candidates"
+        and event.message == "candidate removed before selection"
+        and event.payload["reason"] == "Only some accounts can reply."
+        for event in result["snapshot"].events
+    )
+
+
 def test_compose_reply_text_never_exceeds_max_length() -> None:
     acknowledgment = "A" * 10
     fuller_angle = "B" * 20
@@ -135,6 +165,187 @@ def test_tweet_record_parses_created_at() -> None:
     )
 
     assert tweet.created_at == datetime.fromisoformat("2026-04-20T03:35:55+00:00")
+
+
+def test_tweet_record_parses_reply_limit_fields() -> None:
+    tweet = TweetRecord.from_payload(
+        {
+            "id": "111",
+            "text": "hello",
+            "author": {"screenName": "demo", "verified": True},
+            "canReply": False,
+            "replyLimitHeadline": "Who can reply?",
+            "replyLimitReason": "Only some accounts can reply.",
+            "replyRestrictionPolicy": "Co",
+        }
+    )
+
+    assert tweet.can_reply is False
+    assert tweet.reply_limit_headline == "Who can reply?"
+    assert tweet.reply_limit_reason == "Only some accounts can reply."
+    assert tweet.reply_restriction_policy == "Co"
+
+
+def test_twitter_client_fetch_tweet_records_conversation_policy_as_risk() -> None:
+    class LocalTwitterClient(TwitterClient):
+        def _run_json(self, args, *, allow_error_payload=False):
+            return type("Exec", (), {
+                "payload": {
+                    "data": [
+                        {
+                            "id": "111",
+                            "text": "hello",
+                            "author": {"screenName": "demo", "verified": True},
+                        }
+                    ]
+                }
+            })()
+
+        def _fetch_tweet_detail_payload(self, tweet_id: str):
+            return {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": [
+                            {
+                                "entries": [
+                                    {
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "TweetWithVisibilityResults",
+                                                        "tweet": {
+                                                            "rest_id": tweet_id,
+                                                            "legacy": {
+                                                                "conversation_control": {"policy": "Co"}
+                                                            },
+                                                        },
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+
+    client = LocalTwitterClient(
+        twitter_bin="twitter",
+        credentials=TwitterCredentials(auth_token="token", ct0="csrf"),
+    )
+
+    tweet = client.fetch_tweet("111")
+
+    assert tweet.can_reply is None
+    assert tweet.reply_limit_headline is None
+    assert tweet.reply_limit_reason is None
+    assert tweet.reply_restriction_policy == "Co"
+
+
+def test_twitter_client_fetch_tweet_locally_enriches_reply_limit(monkeypatch) -> None:
+    class LocalTwitterClient(TwitterClient):
+        def _run_json(self, args, *, allow_error_payload=False):
+            return type("Exec", (), {
+                "payload": {
+                    "data": [
+                        {
+                            "id": "111",
+                            "text": "hello",
+                            "author": {"screenName": "demo", "verified": True},
+                        }
+                    ]
+                }
+            })()
+
+        def _fetch_tweet_detail_payload(self, tweet_id: str):
+            assert tweet_id == "111"
+            return {
+                "data": {
+                    "threaded_conversation_with_injections_v2": {
+                        "instructions": [
+                            {
+                                "entries": [
+                                    {
+                                        "content": {
+                                            "itemContent": {
+                                                "tweet_results": {
+                                                    "result": {
+                                                        "__typename": "TweetWithVisibilityResults",
+                                                        "limitedActionResults": {
+                                                            "limited_actions": [
+                                                                {
+                                                                    "action": "Reply",
+                                                                    "prompt": {
+                                                                        "headline": {"text": "Who can reply?"},
+                                                                        "subtext": {"text": "Only some accounts can reply."},
+                                                                    },
+                                                                }
+                                                            ]
+                                                        },
+                                                        "tweet": {"rest_id": "111"},
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+
+    client = LocalTwitterClient(
+        twitter_bin="twitter",
+        credentials=TwitterCredentials(auth_token="token", ct0="csrf"),
+    )
+
+    def fake_detail_payload(tweet_id: str):
+        assert tweet_id == "111"
+        return {
+            "data": {
+                "threaded_conversation_with_injections_v2": {
+                    "instructions": [
+                        {
+                            "entries": [
+                                {
+                                    "content": {
+                                        "itemContent": {
+                                            "tweet_results": {
+                                                "result": {
+                                                    "__typename": "TweetWithVisibilityResults",
+                                                    "limitedActionResults": {
+                                                        "limited_actions": [
+                                                            {
+                                                                "action": "Reply",
+                                                                "prompt": {
+                                                                    "headline": {"text": "Who can reply?"},
+                                                                    "subtext": {"text": "Only some accounts can reply."},
+                                                                },
+                                                            }
+                                                        ]
+                                                    },
+                                                    "tweet": {"rest_id": "111"},
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
+    tweet = client.fetch_tweet("111")
+
+    assert tweet.can_reply is False
+    assert tweet.reply_limit_headline == "Who can reply?"
+    assert tweet.reply_limit_reason == "Only some accounts can reply."
 
 
 def test_feed_candidate_carries_created_at_from_feed(monkeypatch, tmp_path: Path) -> None:
@@ -1859,6 +2070,102 @@ def test_feed_engage_ai_moderation_filters_disallowed_candidates(monkeypatch, tm
     assert body["result"]["selected_candidate"]["tweet_id"] == "222"
     assert any(
         event["node"] == "moderate_candidates" and event["message"] == "candidate filtered by ai moderation"
+        for event in body["result"]["events"]
+    )
+
+
+def test_feed_engage_deprioritizes_reply_restriction_risk_after_local_hydration(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, *, can_reply=None, policy: str | None = None, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.created_at = None
+            self.can_reply = can_reply
+            self.reply_limit_reason = "Only some accounts can reply." if can_reply is False else None
+            self.reply_limit_headline = "Who can reply?" if can_reply is False else None
+            self.reply_restriction_policy = policy
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+                "canReply": can_reply,
+                "replyLimitReason": self.reply_limit_reason,
+                "replyLimitHeadline": self.reply_limit_headline,
+                "replyRestrictionPolicy": policy,
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [
+                FakeTweet("111", "limited", "preview one", can_reply=None),
+                FakeTweet("222", "open", "preview two", can_reply=None),
+            ]
+
+        def fetch_tweet(self, tweet_id: str):
+            if tweet_id == "111":
+                return FakeTweet(tweet_id, "limited", "full one", can_reply=None, policy="Co")
+            return FakeTweet(tweet_id, "open", "full two", can_reply=True)
+
+        def reply(self, tweet_id: str, text: str):
+            raise AssertionError("reply should not be called in dry_run")
+
+        def follow(self, screen_name: str):
+            raise AssertionError("follow should not be called in dry_run")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {
+                    "tweet_id": candidate.tweet_id,
+                    "allowed": True,
+                    "category": None,
+                    "reason": "allowed",
+                })()
+                for candidate in candidates
+            ]
+
+        def select_candidate(self, candidates):
+            assert [candidate.tweet_id for candidate in candidates] == ["222", "111"]
+            return type("Selection", (), {"tweet_id": "222", "reason": "lower-risk candidate comes first"})()
+
+        def classify_reply_style(self, candidate):
+            return type("Style", (), {"style": "non_technical", "reason": "rule_based"})()
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "Nice one.", "rationale": "safe"})()
+
+        def draft_repo_post(self, context):
+            raise AssertionError("repo post drafting should not be called")
+
+    monkeypatch.setattr(
+        "x_atuo.automation.graph.TwitterClient.from_config",
+        lambda *args, **kwargs: FakeClient(),
+    )
+    monkeypatch.setattr(
+        "x_atuo.automation.graph.build_ai_provider",
+        lambda settings: FakeAIProvider(),
+    )
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "reply-limit.sqlite3"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/hooks/twitter/feed-engage",
+            json={"dry_run": True, "feed_count": 2, "mode": "ai_auto"},
+        )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["result"]["selected_candidate"]["tweet_id"] == "222"
+    assert any(
+        event["node"] == "select_candidate"
+        and event["message"] == "candidate de-prioritized after hydration"
+        and event["payload"]["policy"] == "Co"
         for event in body["result"]["events"]
     )
 
