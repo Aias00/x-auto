@@ -27,9 +27,10 @@ Twitter automation service for scheduler-driven `feed-engage` workflows, with La
 - Scheduler is the only execution entrypoint
   - `feed-engage` is the only remaining executable workflow
   - FastAPI no longer exposes write routes under `/hooks/twitter/*`
-- `feed-engage` requires an AI provider for moderation, selection, and drafting; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out before execution
-- `feed-engage` trims the candidate pool to a newest-first shortlist, hydrates that shortlist with full tweet text, then runs AI selection and a final single-candidate full-text review before drafting
-- hydrated shortlist candidates are cached in SQLite and reused across runs before refetching feed; cached candidates are leased to a single run at a time and expire automatically
+- `feed-engage` requires an AI provider for moderation and drafting; politics, crime, violence, fraud, drugs, war, and law-enforcement / case-news content is filtered out before execution
+- `feed-engage` keeps the feed candidates in newest-first order, then walks that candidate pool one-by-one: hydrate one candidate, validate it, and stop at the first acceptable candidate before candidate-policy checks and drafting
+- hydrated candidate-pool entries are cached in SQLite and reused across runs before refetching feed; cached candidates are leased to a single run at a time and expire automatically
+- AI node events include per-call latency and input-size metrics for moderation, style classification, and drafting
 - scheduled `feed-engage` runs are queued behind a single in-process worker with a bounded backlog; when the backlog is full, new scheduled requests are recorded as blocked runs instead of silently disappearing
 - AI drafting/selection is required for the active runtime path
   - `X_ATUO_AI__PROVIDER=mock` enables local fake AI for testing
@@ -70,8 +71,7 @@ Notes:
   - `FEED_ENGAGE_TRIGGER`, `FEED_ENGAGE_SECONDS`, `FEED_ENGAGE_JITTER_SECONDS`, `FEED_ENGAGE_MINUTE`, `FEED_ENGAGE_HOUR`, `FEED_ENGAGE_DAY`, `FEED_ENGAGE_DAY_OF_WEEK` shape the schedule
 - Candidate-pool tuning lives under `X_ATUO_POLICIES__*`:
   - `CANDIDATE_REFRESH_ROUNDS`: how many times `feed-engage` may refetch when the pool empties
-  - `CANDIDATE_HYDRATION_COUNT`: shortlist size to hydrate with full tweet text before selection
-  - `CANDIDATE_CACHE_PENDING_TTL_MINUTES`: how long pending hydrated shortlist entries stay reusable
+  - `CANDIDATE_CACHE_PENDING_TTL_MINUTES`: how long pending hydrated candidate-pool entries stay reusable
   - `CANDIDATE_CACHE_REJECTED_TTL_MINUTES`: how long rejected shortlist entries are retained for diagnostics
   - `CANDIDATE_CACHE_CLAIM_TTL_MINUTES`: how long a run leases claimed shortlist entries before they return to `pending`
 

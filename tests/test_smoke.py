@@ -16,6 +16,7 @@ from x_atuo.automation.config import AISettings
 from x_atuo.automation.config import SchedulerSettings
 from x_atuo.automation.graph import AutomationGraph
 from x_atuo.automation.graph import WorkflowAdapters
+from x_atuo.automation.graph import _AI_MODERATION_METADATA_KEY
 from x_atuo.automation.graph import _build_runtime_graph
 from x_atuo.automation.policies import build_dedupe_key
 from x_atuo.automation.scheduler import AutomationScheduler
@@ -29,6 +30,7 @@ from x_atuo.automation.storage import AutomationStorage
 import x_atuo.automation.api as automation_api
 from x_atuo.core.ai_client import AIProviderError
 from x_atuo.core.ai_client import OpenAICompatibleProvider
+from x_atuo.core.ai_client import build_moderation_cache_key
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_client import TwitterCredentials
 from x_atuo.core.twitter_models import TweetRecord
@@ -111,11 +113,8 @@ def test_route_after_fetch_feed_retries_immediately_when_refresh_pending() -> No
     assert route == "fetch_feed"
 
 
-def test_route_after_fetch_feed_prefilters_before_ai_moderation() -> None:
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(moderate_candidates=lambda snapshot: []),
-    )
+def test_route_after_fetch_feed_prefilters_before_candidate_evaluation() -> None:
+    graph = AutomationGraph(AutomationConfig())
     request = AutomationRequest.for_feed_engage(job_name="job")
     state = make_initial_state(request)
     state["snapshot"].candidates = [
@@ -127,11 +126,8 @@ def test_route_after_fetch_feed_prefilters_before_ai_moderation() -> None:
     assert route == "prefilter_candidates"
 
 
-def test_route_after_prefilter_runs_ai_moderation_when_available() -> None:
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(moderate_candidates=lambda snapshot: []),
-    )
+def test_route_after_prefilter_goes_directly_to_select_candidate_without_batch_moderation() -> None:
+    graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=None))
     request = AutomationRequest.for_feed_engage(job_name="job")
     state = make_initial_state(request)
     state["snapshot"].candidates = [
@@ -140,11 +136,21 @@ def test_route_after_prefilter_runs_ai_moderation_when_available() -> None:
 
     route = graph.route_after_prefilter(state)
 
-    assert route == "moderate_candidates"
+    assert route == "select_candidate"
 
 
-def test_prefilter_candidates_remove_already_engaged_before_ai_moderation_runs() -> None:
-    seen: list[str] = []
+def test_route_after_selection_goes_directly_to_candidate_policy_guard() -> None:
+    graph = AutomationGraph(AutomationConfig())
+    request = AutomationRequest.for_feed_engage(job_name="job")
+    state = make_initial_state(request)
+
+    route = graph.route_after_selection(state)
+
+    assert route == "candidate_policy_guard"
+
+
+def test_policy_guard_releases_unused_claimed_candidates_after_early_stop() -> None:
+    released: dict[str, object] = {}
 
     class FakeHooks:
         def has_dedupe_key(self, dedupe_key: str) -> bool:
@@ -157,28 +163,95 @@ def test_prefilter_candidates_remove_already_engaged_before_ai_moderation_runs()
             return None
 
         def has_target_tweet_id(self, target_tweet_id: str) -> bool:
-            return target_tweet_id == "111"
+            return False
 
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(
-            policy_hooks=FakeHooks(),
-            moderate_candidates=lambda snapshot: seen.extend(candidate.tweet_id for candidate in snapshot.candidates) or [],
-        ),
-    )
-    request = AutomationRequest.for_feed_engage(job_name="job")
+        def release_claimed_candidate_cache(self, *, workflow: str, run_id: str, tweet_ids: list[str]) -> int:
+            released["workflow"] = workflow
+            released["run_id"] = run_id
+            released["tweet_ids"] = tweet_ids
+            return len(tweet_ids)
+
+    graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=FakeHooks()))
+    request = AutomationRequest.for_feed_engage(job_name="job", run_id="run-123")
     state = make_initial_state(request)
     snapshot = state["snapshot"]
+    snapshot.selected_candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="author1",
+        text="one",
+        author_verified=True,
+        metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"},
+    )
     snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="already", text="old", author_verified=True),
-        FeedCandidate(tweet_id="222", screen_name="fresh", text="new", author_verified=True),
+        snapshot.selected_candidate,
+        FeedCandidate(tweet_id="222", screen_name="author2", text="two", author_verified=True, metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"}),
+        FeedCandidate(tweet_id="333", screen_name="author3", text="three", author_verified=True, metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"}),
     ]
+    snapshot.rendered_text = "draft one"
 
-    prefiltered = asyncio.run(graph.prefilter_candidates(state))
-    assert graph.route_after_prefilter(prefiltered) == "moderate_candidates"
-    asyncio.run(graph.moderate_candidates(prefiltered))
+    result = asyncio.run(graph.policy_guard(state))
 
-    assert seen == ["222"]
+    assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["111"]
+    assert released == {
+        "workflow": "feed_engage",
+        "run_id": "run-123",
+        "tweet_ids": ["222", "333"],
+    }
+    assert any(
+        event.node == "policy_guard"
+        and event.message == "unused claimed candidates released"
+        and event.payload["count"] == 2
+        and event.payload["tweet_ids"] == ["222", "333"]
+        for event in result["snapshot"].events
+    )
+
+
+def test_policy_guard_retries_duplicate_candidate_before_releasing_claims() -> None:
+    released: dict[str, object] = {}
+
+    class FakeHooks:
+        def has_dedupe_key(self, dedupe_key: str) -> bool:
+            return True
+
+        def get_daily_execution_count(self, workflow, day) -> int:
+            return 0
+
+        def get_last_author_engagement(self, screen_name: str):
+            return None
+
+        def has_target_tweet_id(self, target_tweet_id: str) -> bool:
+            return False
+
+        def release_claimed_candidate_cache(self, *, workflow: str, run_id: str, tweet_ids: list[str]) -> int:
+            released["workflow"] = workflow
+            released["run_id"] = run_id
+            released["tweet_ids"] = tweet_ids
+            return len(tweet_ids)
+
+    graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=FakeHooks()))
+    request = AutomationRequest.for_feed_engage(job_name="job", run_id="run-123")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.selected_candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="author1",
+        text="one",
+        author_verified=True,
+        metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"},
+    )
+    snapshot.candidates = [
+        snapshot.selected_candidate,
+        FeedCandidate(tweet_id="222", screen_name="author2", text="two", author_verified=True, metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"}),
+    ]
+    snapshot.rendered_text = "draft one"
+
+    result = asyncio.run(graph.policy_guard(state))
+    routed = graph.route_after_policy(result)
+
+    assert released == {}
+    assert result["snapshot"].selected_candidate is None
+    assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["222"]
+    assert routed == "retry_candidate"
 
 
 def test_prefilter_candidates_filters_unverified_without_policy_hooks() -> None:
@@ -538,6 +611,54 @@ def test_candidate_cache_claims_pending_entries_once(tmp_path: Path) -> None:
     assert [item["tweet_id"] for item in claimed] == ["222", "111"]
     assert claimed_again == []
     assert storage.list_pending_candidate_cache(workflow="feed_engage", limit=10) == []
+
+
+def test_candidate_cache_release_claimed_entries_returns_to_pending(tmp_path: Path) -> None:
+    storage = AutomationStorage(tmp_path / "candidate-cache-release.sqlite3")
+    storage.initialize()
+    storage.upsert_candidate_cache_entries(
+        workflow="feed_engage",
+        source_run_id="run_1",
+        candidates=[
+            {
+                "tweet_id": "111",
+                "screen_name": "demo1",
+                "created_at": "2026-04-20T03:35:55+00:00",
+                "text": "cached text 111",
+                "metadata": {"id": "111", "text": "cached text 111", "author": {"screenName": "demo1", "verified": True}},
+            },
+            {
+                "tweet_id": "222",
+                "screen_name": "demo2",
+                "created_at": "2026-04-20T03:36:55+00:00",
+                "text": "cached text 222",
+                "metadata": {"id": "222", "text": "cached text 222", "author": {"screenName": "demo2", "verified": True}},
+            },
+        ],
+        expires_at="2999-01-01T00:00:00+00:00",
+    )
+
+    claimed = storage.claim_pending_candidate_cache(
+        workflow="feed_engage",
+        limit=2,
+        run_id="run_claim_1",
+        lease_expires_at="2999-01-01T00:30:00+00:00",
+    )
+    released = storage.release_claimed_candidate_cache(
+        workflow="feed_engage",
+        run_id="run_claim_1",
+        tweet_ids=["111"],
+    )
+    reclaimed = storage.claim_pending_candidate_cache(
+        workflow="feed_engage",
+        limit=1,
+        run_id="run_claim_2",
+        lease_expires_at="2999-01-01T00:31:00+00:00",
+    )
+
+    assert [item["tweet_id"] for item in claimed] == ["222", "111"]
+    assert released == 1
+    assert [item["tweet_id"] for item in reclaimed] == ["111"]
 
 
 def test_candidate_cache_cleanup_releases_expired_claims(tmp_path: Path) -> None:
@@ -973,9 +1094,6 @@ def test_scheduler_dispatch_persists_reply_restriction_reason_in_run_payload(mon
         def moderate_candidates(self, candidates):
             raise AssertionError("prefilter exhaustion should block before AI moderation")
 
-        def select_candidate(self, candidates):
-            raise AssertionError("prefilter exhaustion should block before AI selection")
-
         def classify_reply_style(self, candidate):
             raise AssertionError("drafting should not run for blocked scheduler executions")
 
@@ -1149,7 +1267,7 @@ def test_openai_compatible_provider_uses_candidate_moderation_prompt() -> None:
     provider._chat = fake_chat  # type: ignore[method-assign]
 
     results = provider.moderate_candidates(
-        [type("Candidate", (), {"model_dump": lambda self, mode="json": {"tweet_id": "1", "text": "langgraph guide"}})()]
+        [type("Candidate", (), {"model_dump": lambda self, mode="json": {"tweet_id": "1", "text": "langgraph guide", "metadata": {"_x_atuo_runtime": True, "topic": "dev"}}})()]
     )
 
     assert results[0].tweet_id == "1"
@@ -1157,6 +1275,24 @@ def test_openai_compatible_provider_uses_candidate_moderation_prompt() -> None:
     assert prompts[0][0] == (
         "Review Twitter feed candidates for reply safety. Reject anything about crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow technical, product, engineering, builder, developer-adjacent, pets and animals, lifestyle, food, travel, scenic photography, entertainment, memes, and casual social content. Always allow posts from @elonmusk. Return JSON with a results array of {tweet_id, allowed, category, reason}."
     )
+    payload = __import__("json").loads(prompts[0][1])
+    assert payload == [{"tweet_id": "1", "text": "langgraph guide"}]
+
+
+def test_moderation_cache_key_changes_when_non_text_payload_changes() -> None:
+    candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="builder",
+        text="same text",
+        author_verified=True,
+        metadata={"id": "111", "author": {"screenName": "builder", "verified": True}, "media": [{"type": "photo"}]},
+    )
+    original_key = build_moderation_cache_key(candidate, provider="openai_compatible", model="demo-model")
+
+    candidate.metadata = {"id": "111", "author": {"screenName": "builder", "verified": True}, "media": [{"type": "video"}]}
+    updated_key = build_moderation_cache_key(candidate, provider="openai_compatible", model="demo-model")
+
+    assert updated_key != original_key
 
 
 
@@ -1213,6 +1349,89 @@ def test_openai_compatible_provider_uses_compact_draft_reply_payload_with_media_
         "media_types": ["video", "photo"],
     }
     assert "metadata" not in payload["candidate"]
+
+
+def test_runtime_draft_metrics_use_compact_prompt_payload(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+                "media": [{"type": "photo", "url": "https://example.com/image.jpg"}],
+                "internal": "large ignored field",
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder1", "preview")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder1", "full api detail")
+
+        def reply(self, tweet_id: str, text: str):
+            return type("Reply", (), {
+                "action": "reply",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": tweet_id,
+                "tweet_id": f"reply_{tweet_id}",
+                "screen_name": "builder1",
+                "text": text,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+        def follow(self, screen_name: str):
+            return type("Follow", (), {
+                "action": "follow",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": None,
+                "tweet_id": None,
+                "screen_name": screen_name,
+                "text": None,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            return [
+                type("Moderation", (), {"tweet_id": candidates[0].tweet_id, "allowed": True, "category": None, "reason": "safe"})()
+            ]
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+
+    storage = AutomationStorage(tmp_path / "runtime-draft-bytes.sqlite3")
+    storage.initialize()
+    graph = _build_runtime_graph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        storage,
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
+
+    snapshot = asyncio.run(graph.invoke(request))
+
+    draft_event = next(event for event in snapshot.events if event.node == "draft_reply" and event.message == "base ai draft generated")
+    assert draft_event.payload["ai_draft_input_bytes"] < len(__import__("json").dumps(snapshot.selected_candidate.model_dump(mode="json")).encode("utf-8"))
 
 
 def test_openai_compatible_provider_uses_non_technical_reply_prompt() -> None:
@@ -1347,9 +1566,6 @@ def test_runtime_observability_does_not_mutate_request_metadata(monkeypatch, tmp
                 for candidate in candidates
             ]
 
-        def select_candidate(self, candidates):
-            return type("Selection", (), {"tweet_id": candidates[0].tweet_id, "reason": "first"})()
-
         def draft_reply(self, candidate, context=None):
             return type("Draft", (), {"text": "short reply", "rationale": "test"})()
 
@@ -1370,128 +1586,392 @@ def test_runtime_observability_does_not_mutate_request_metadata(monkeypatch, tmp
     assert fetch_event.payload["candidate_source"] == "feed"
 
 
-def test_feed_engage_moderation_fail_closed_when_all_candidates_filtered() -> None:
-    graph = AutomationGraph(
+def test_runtime_select_candidate_uses_single_candidate_moderation_before_policy_guard(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder1", "preview")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder1", "full api detail")
+
+    class FakeAIProvider:
+        def __init__(self) -> None:
+            self.moderation_calls: list[list[str | None]] = []
+
+        def moderate_candidates(self, candidates):
+            self.moderation_calls.append([candidate.text for candidate in candidates])
+            return [
+                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": True, "category": None, "reason": "safe"})()
+                for candidate in candidates
+            ]
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    provider = FakeAIProvider()
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: provider)
+
+    storage = AutomationStorage(tmp_path / "runtime-moderation-cache.sqlite3")
+    storage.initialize()
+    graph = _build_runtime_graph(
         AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
-        WorkflowAdapters(
-            policy_hooks=None,
-            moderate_candidates=lambda snapshot: [
-                type("Moderation", (), {"tweet_id": candidate.tweet_id, "allowed": False, "category": "blocked", "reason": "disallowed"})()
-                for candidate in snapshot.candidates
-            ],
-        ),
+        storage,
     )
-    request = AutomationRequest.for_feed_engage(job_name="job")
-    state = make_initial_state(request)
-    snapshot = state["snapshot"]
-    snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="author1", text="one", author_verified=True),
-        FeedCandidate(tweet_id="222", screen_name="author2", text="two", author_verified=True),
-    ]
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
 
-    result = asyncio.run(graph.moderate_candidates(state))
-    routed = graph.route_after_moderation(result)
+    snapshot = asyncio.run(graph.invoke(request))
 
-    assert result["snapshot"].status is RunStatus.BLOCKED
-    assert routed == "blocked"
-    assert "all candidates filtered by ai moderation" in result["snapshot"].errors
+    assert snapshot.status.value == "completed"
+    assert provider.moderation_calls == [["full api detail"]]
 
 
-def test_feed_engage_moderation_exception_marks_failed() -> None:
-    def fail_moderation(snapshot):
-        raise AIProviderError("moderation unavailable")
+def test_runtime_select_candidate_stops_after_first_allowed_candidate(monkeypatch, tmp_path: Path) -> None:
+    fetch_calls: list[str] = []
 
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(
-            policy_hooks=None,
-            moderate_candidates=fail_moderation,
-        ),
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [
+                FakeTweet("111", "builder1", "preview one"),
+                FakeTweet("222", "builder2", "preview two"),
+                FakeTweet("333", "builder3", "preview three"),
+            ]
+
+        def fetch_tweet(self, tweet_id: str):
+            fetch_calls.append(tweet_id)
+            return FakeTweet(tweet_id, f"builder{tweet_id[0]}", f"full text {tweet_id}")
+
+        def reply(self, tweet_id: str, text: str):
+            return type("Reply", (), {
+                "action": "reply",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": tweet_id,
+                "tweet_id": f"reply_{tweet_id}",
+                "screen_name": "builder",
+                "text": text,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+        def follow(self, screen_name: str):
+            return type("Follow", (), {
+                "action": "follow",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": None,
+                "tweet_id": None,
+                "screen_name": screen_name,
+                "text": None,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+    class FakeAIProvider:
+        def __init__(self) -> None:
+            self.moderation_calls: list[list[str | None]] = []
+
+        def moderate_candidates(self, candidates):
+            self.moderation_calls.append([candidate.text for candidate in candidates])
+            return [
+                type("Moderation", (), {"tweet_id": candidates[0].tweet_id, "allowed": True, "category": None, "reason": "safe"})()
+            ]
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    provider = FakeAIProvider()
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: provider)
+
+    storage = AutomationStorage(tmp_path / "runtime-sequential-select.sqlite3")
+    storage.initialize()
+    graph = _build_runtime_graph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        storage,
     )
-    request = AutomationRequest.for_feed_engage(job_name="job")
-    state = make_initial_state(request)
-    snapshot = state["snapshot"]
-    snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="author1", text="one", author_verified=True),
-    ]
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
 
-    result = asyncio.run(graph.moderate_candidates(state))
-    routed = graph.route_after_moderation(result)
+    snapshot = asyncio.run(graph.invoke(request))
 
-    assert result["snapshot"].status is RunStatus.FAILED
-    assert "ai moderation failed: moderation unavailable" in result["snapshot"].errors
-    assert routed == "finalize"
+    assert snapshot.status.value == "completed"
+    assert fetch_calls == ["111"]
+    assert provider.moderation_calls == [["full text 111"]]
+    assert snapshot.selection_source == "ordered_candidates"
+    select_event = next(event for event in snapshot.events if event.node == "select_candidate" and event.message == "candidate selected")
+    assert select_event.payload["hydrated_count"] == 1
+    assert select_event.payload["ai_moderation_candidate_count"] == 1
 
 
-def test_feed_engage_selected_candidate_review_retries_with_next_candidate() -> None:
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(
-            selected_candidate_review=lambda snapshot: type(
-                "Moderation",
-                (),
-                {
-                    "tweet_id": snapshot.selected_candidate.tweet_id,
-                    "allowed": False,
-                    "category": "war",
-                    "reason": "war topic",
+def test_runtime_select_candidate_checks_next_candidate_after_rejection(monkeypatch, tmp_path: Path) -> None:
+    fetch_calls: list[str] = []
+
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [
+                FakeTweet("111", "builder1", "preview one"),
+                FakeTweet("222", "builder2", "preview two"),
+            ]
+
+        def fetch_tweet(self, tweet_id: str):
+            fetch_calls.append(tweet_id)
+            return FakeTweet(tweet_id, f"builder{tweet_id[0]}", f"full text {tweet_id}")
+
+        def reply(self, tweet_id: str, text: str):
+            return type("Reply", (), {
+                "action": "reply",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": tweet_id,
+                "tweet_id": f"reply_{tweet_id}",
+                "screen_name": "builder",
+                "text": text,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+        def follow(self, screen_name: str):
+            return type("Follow", (), {
+                "action": "follow",
+                "ok": True,
+                "dry_run": True,
+                "target_tweet_id": None,
+                "tweet_id": None,
+                "screen_name": screen_name,
+                "text": None,
+                "payload": {"ok": True},
+                "error_code": None,
+                "error_message": None,
+            })()
+
+    class FakeAIProvider:
+        def __init__(self) -> None:
+            self.moderation_calls: list[list[str | None]] = []
+
+        def moderate_candidates(self, candidates):
+            text = candidates[0].text
+            self.moderation_calls.append([text])
+            allowed = text == "full text 222"
+            reason = "safe" if allowed else "war topic"
+            category = None if allowed else "war"
+            return [
+                type("Moderation", (), {"tweet_id": candidates[0].tweet_id, "allowed": allowed, "category": category, "reason": reason})()
+            ]
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    provider = FakeAIProvider()
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: provider)
+
+    storage = AutomationStorage(tmp_path / "runtime-sequential-next.sqlite3")
+    storage.initialize()
+    graph = _build_runtime_graph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        storage,
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
+
+    snapshot = asyncio.run(graph.invoke(request))
+
+    assert snapshot.status.value == "completed"
+    assert fetch_calls == ["111", "222"]
+    assert provider.moderation_calls == [["full text 111"], ["full text 222"]]
+    assert snapshot.selected_candidate is not None
+    assert snapshot.selected_candidate.tweet_id == "222"
+
+
+def test_candidate_cache_upsert_strips_internal_runtime_metadata(tmp_path: Path) -> None:
+    storage = AutomationStorage(tmp_path / "candidate-cache-strip-runtime.sqlite3")
+    storage.initialize()
+    storage.upsert_candidate_cache_entries(
+        workflow="feed_engage",
+        source_run_id="source-run",
+        candidates=[
+            {
+                "tweet_id": "111",
+                "screen_name": "builder1",
+                "created_at": "2026-04-20T03:35:55+00:00",
+                "text": "cached full api detail",
+                "metadata": {
+                    "id": "111",
+                    "text": "cached full api detail",
+                    "author": {"screenName": "builder1", "verified": True},
+                    "_x_atuo_hydrated": True,
+                    _AI_MODERATION_METADATA_KEY: {
+                        "tweet_id": "111",
+                        "cache_key": "dead",
+                        "allowed": True,
+                        "category": None,
+                        "reason": "safe",
+                    },
                 },
-            )(),
-            policy_hooks=None,
-        ),
+            }
+        ],
+        expires_at="2999-01-01T00:00:00+00:00",
     )
-    request = AutomationRequest.for_feed_engage(job_name="job")
-    state = make_initial_state(request)
-    snapshot = state["snapshot"]
-    snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="author1", text="preview one", author_verified=True),
-        FeedCandidate(tweet_id="222", screen_name="author2", text="preview two", author_verified=True),
-    ]
-    snapshot.selected_candidate = snapshot.candidates[0]
-    snapshot.selection_source = "ai"
-    snapshot.selection_reason = "first choice"
-    snapshot.reply_context = {"reply_style": "technical"}
-    snapshot.rendered_text = "draft one"
-    snapshot.drafting_source = "ai"
 
-    result = asyncio.run(graph.selected_candidate_review(state))
-    routed = graph.route_after_selected_candidate_review(result)
+    pending = storage.list_pending_candidate_cache(workflow="feed_engage", limit=10)
 
-    assert result["snapshot"].selected_candidate is None
-    assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["222"]
-    assert result["snapshot"].selection_source is None
-    assert result["snapshot"].selection_reason is None
-    assert result["snapshot"].reply_context == {}
-    assert result["snapshot"].rendered_text is None
-    assert result["snapshot"].drafting_source is None
-    assert routed == "select_candidate"
+    assert pending[0]["metadata"] == {
+        "id": "111",
+        "text": "cached full api detail",
+        "author": {"screenName": "builder1", "verified": True},
+    }
 
 
-def test_feed_engage_selected_candidate_review_exception_marks_failed() -> None:
-    def fail_review(snapshot):
-        raise AIProviderError("review unavailable")
+def test_runtime_cached_moderation_misses_when_non_text_payload_changes(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, topic: str):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "topic": topic,
+                "author": {"screenName": screen_name, "verified": True},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": True})()
+            self.screen_name = screen_name
+            self.verified = True
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
 
-    graph = AutomationGraph(
-        AutomationConfig(),
-        WorkflowAdapters(
-            selected_candidate_review=fail_review,
-            policy_hooks=None,
-        ),
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder1", "same text", "fresh")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder1", "same text", "fresh")
+
+    class FakeAIProvider:
+        def __init__(self) -> None:
+            self.moderation_calls = 0
+
+        def moderate_candidates(self, candidates):
+            self.moderation_calls += 1
+            return [
+                type("Moderation", (), {"tweet_id": candidates[0].tweet_id, "allowed": True, "category": None, "reason": "safe"})()
+            ]
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    text = "same text"
+    stale_candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="builder1",
+        text=text,
+        created_at=datetime.fromisoformat("2026-04-20T03:35:55+00:00"),
+        author_verified=True,
+        metadata={"id": "111", "text": text, "topic": "stale", "author": {"screenName": "builder1", "verified": True}},
     )
-    request = AutomationRequest.for_feed_engage(job_name="job")
-    state = make_initial_state(request)
-    snapshot = state["snapshot"]
-    snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="author1", text="preview one", author_verified=True),
-    ]
-    snapshot.selected_candidate = snapshot.candidates[0]
+    storage = AutomationStorage(tmp_path / "runtime-moderation-cache-miss.sqlite3")
+    storage.initialize()
+    storage.upsert_candidate_cache_entries(
+        workflow="feed_engage",
+        source_run_id="source-run",
+        candidates=[
+            {
+                "tweet_id": "111",
+                "screen_name": "builder1",
+                "created_at": "2026-04-20T03:35:55+00:00",
+                "text": text,
+                "metadata": {
+                    "id": "111",
+                    "text": text,
+                    "topic": "stale",
+                    "author": {"screenName": "builder1", "verified": True},
+                    _AI_MODERATION_METADATA_KEY: {
+                        "tweet_id": "111",
+                        "cache_key": build_moderation_cache_key(stale_candidate, provider="none", model=None),
+                        "allowed": True,
+                        "category": None,
+                        "reason": "safe",
+                    },
+                },
+            }
+        ],
+        expires_at="2999-01-01T00:00:00+00:00",
+    )
+    provider = FakeAIProvider()
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: provider)
+    graph = _build_runtime_graph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        storage,
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
 
-    result = asyncio.run(graph.selected_candidate_review(state))
-    routed = graph.route_after_selected_candidate_review(result)
+    snapshot = asyncio.run(graph.invoke(request))
 
-    assert result["snapshot"].status is RunStatus.FAILED
-    assert "ai moderation failed: review unavailable" in result["snapshot"].errors
-    assert routed == "finalize"
+    assert snapshot.status is RunStatus.COMPLETED
+    assert provider.moderation_calls == 1
 
 
 def test_feed_engage_candidate_policy_guard_retries_duplicate_candidate() -> None:
@@ -1536,7 +2016,7 @@ def test_feed_engage_candidate_policy_guard_retries_duplicate_candidate() -> Non
     assert routed == "retry_candidate"
 
 
-def test_feed_engage_select_candidate_fails_when_ai_selection_errors() -> None:
+def test_feed_engage_select_candidate_fails_when_candidate_evaluation_errors() -> None:
     def fail_selection(snapshot):
         raise AIProviderError("selection unavailable")
 
@@ -1555,9 +2035,66 @@ def test_feed_engage_select_candidate_fails_when_ai_selection_errors() -> None:
     routed = graph.route_after_selection(result)
 
     assert result["snapshot"].status is RunStatus.FAILED
-    assert "ai selection failed: selection unavailable" in result["snapshot"].errors
+    assert "candidate evaluation failed: selection unavailable" in result["snapshot"].errors
     assert result["snapshot"].selected_candidate is None
     assert routed == "finalize"
+
+
+def test_runtime_select_candidate_reports_moderation_failure_as_candidate_evaluation(monkeypatch, tmp_path: Path) -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = text
+            self.raw = {
+                "id": tweet_id,
+                "text": text,
+                "author": {"screenName": screen_name, "verified": verified},
+            }
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+            self.screen_name = screen_name
+            self.verified = verified
+            self.can_reply = True
+            self.reply_limit_reason = None
+            self.reply_limit_headline = None
+            self.reply_restriction_policy = None
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
+            return [FakeTweet("111", "builder1", "preview")]
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "builder1", "full api detail")
+
+    class FakeAIProvider:
+        def moderate_candidates(self, candidates):
+            raise AIProviderError("moderation unavailable")
+
+        def draft_reply(self, candidate, context=None):
+            return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+    monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
+    monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
+
+    storage = AutomationStorage(tmp_path / "runtime-candidate-evaluation.sqlite3")
+    storage.initialize()
+    graph = _build_runtime_graph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        storage,
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=True, approval_mode="ai_auto")
+
+    snapshot = asyncio.run(graph.invoke(request))
+
+    assert snapshot.status is RunStatus.FAILED
+    assert "candidate evaluation failed: moderation unavailable" in snapshot.errors
+    assert any(
+        event.node == "select_candidate"
+        and event.message == "candidate evaluation failed"
+        and event.payload["error"] == "moderation unavailable"
+        for event in snapshot.events
+    )
 
 
 def test_feed_engage_draft_text_fails_when_ai_draft_errors() -> None:
@@ -1632,21 +2169,3 @@ def test_feed_engage_execute_refreshes_after_no_candidate_succeeded() -> None:
         and event.message == "execution deferred to candidate refresh"
         for event in result["snapshot"].events
     )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

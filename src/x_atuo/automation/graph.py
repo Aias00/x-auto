@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
@@ -35,6 +36,9 @@ from x_atuo.automation.state import (
 from x_atuo.core.ai_client import (
     AIModerationResult,
     AIProviderError,
+    build_draft_prompt_payload,
+    build_moderation_cache_key,
+    build_moderation_prompt_payload,
     build_ai_provider,
 )
 from x_atuo.core.twitter_client import TwitterClient
@@ -43,6 +47,7 @@ from x_atuo.core.twitter_client import _reply_control_reason
 from x_atuo.core.twitter_models import Candidate, TweetRecord
 
 StateCallable = Callable[[WorkflowStateModel], Any]
+_AI_MODERATION_METADATA_KEY = "_x_atuo_ai_moderation"
 
 
 async def maybe_await(value: Any) -> Any:
@@ -159,12 +164,75 @@ def _call_with_optional_context(method: Callable[..., Any], *args: Any) -> Any:
     return method(*args[:1])
 
 
+def _elapsed_ms(started_at: float) -> float:
+    return round((perf_counter() - started_at) * 1000, 2)
+
+
+def _moderation_payload_bytes(candidates: list[FeedCandidate]) -> int:
+    return len(
+        json.dumps(
+            build_moderation_prompt_payload(candidates),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+
+def _draft_payload_bytes(candidate: FeedCandidate) -> int:
+    return len(
+        json.dumps(
+            build_draft_prompt_payload(candidate),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+
+def _cached_ai_moderation(
+    candidate: FeedCandidate,
+    *,
+    provider_name: str | None,
+    model_name: str | None,
+) -> AIModerationResult | None:
+    metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+    raw = metadata.get(_AI_MODERATION_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("tweet_id") != candidate.tweet_id:
+        return None
+    if raw.get("cache_key") != build_moderation_cache_key(candidate, provider=provider_name, model=model_name):
+        return None
+    allowed = raw.get("allowed")
+    if not isinstance(allowed, bool):
+        return None
+    return AIModerationResult(
+        tweet_id=candidate.tweet_id,
+        allowed=allowed,
+        category=str(raw["category"]) if raw.get("category") is not None else None,
+        reason=str(raw.get("reason") or ""),
+    )
+
+
+def _store_ai_moderation(
+    candidate: FeedCandidate,
+    moderation: AIModerationResult,
+    *,
+    provider_name: str | None,
+    model_name: str | None,
+) -> None:
+    metadata = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
+    metadata[_AI_MODERATION_METADATA_KEY] = {
+        "tweet_id": moderation.tweet_id,
+        "cache_key": build_moderation_cache_key(candidate, provider=provider_name, model=model_name),
+        "allowed": bool(moderation.allowed),
+        "category": moderation.category,
+        "reason": moderation.reason,
+    }
+    candidate.metadata = metadata
+
+
 @dataclass(slots=True)
 class WorkflowAdapters:
     fetch_feed: StateCallable | None = None
-    moderate_candidates: StateCallable | None = None
     select_candidate: StateCallable | None = None
-    selected_candidate_review: StateCallable | None = None
     draft_reply: StateCallable | None = None
     execute_engage: StateCallable | None = None
     policy_hooks: PolicyHooks | None = None
@@ -177,7 +245,6 @@ class AutomationGraph:
         self.config = config
         self.adapters = adapters or WorkflowAdapters()
         self.max_candidate_refresh_rounds = config.policies.candidate_refresh_rounds
-        self.candidate_hydration_count = max(1, config.policies.candidate_hydration_count)
         self.graph = self._build_graph()
 
     def _schedule_candidate_refresh(self, snapshot: WorkflowStateModel, *, node: str, reason: str) -> bool:
@@ -254,11 +321,8 @@ class AutomationGraph:
         workflow = StateGraph(AutomationGraphState)
         workflow.add_node("prepare", self.prepare)
         workflow.add_node("fetch_feed", self.fetch_feed)
-        workflow.add_node("moderate_candidates", self.moderate_candidates)
         workflow.add_node("prefilter_candidates", self.prefilter_candidates)
-        workflow.add_node("shortlist_prepare_candidates", self.shortlist_prepare_candidates)
         workflow.add_node("select_candidate", self.select_candidate)
-        workflow.add_node("selected_candidate_review", self.selected_candidate_review)
         workflow.add_node("candidate_policy_guard", self.candidate_policy_guard)
         workflow.add_node("draft_text", self.draft_text)
         workflow.add_node("policy_guard", self.policy_guard)
@@ -283,43 +347,20 @@ class AutomationGraph:
             },
         )
         workflow.add_conditional_edges(
-            "moderate_candidates",
-            self.route_after_moderation,
-            {
-                "fetch_feed": "fetch_feed",
-                "shortlist_prepare_candidates": "shortlist_prepare_candidates",
-                "blocked": "blocked",
-                "finalize": "finalize",
-            },
-        )
-        workflow.add_conditional_edges(
             "prefilter_candidates",
             self.route_after_prefilter,
             {
                 "fetch_feed": "fetch_feed",
-                "moderate_candidates": "moderate_candidates",
-                "shortlist_prepare_candidates": "shortlist_prepare_candidates",
+                "select_candidate": "select_candidate",
                 "blocked": "blocked",
                 "finalize": "finalize",
             },
         )
-        workflow.add_edge("shortlist_prepare_candidates", "select_candidate")
         workflow.add_conditional_edges(
             "select_candidate",
             self.route_after_selection,
             {
-                "selected_candidate_review": "selected_candidate_review",
-                "finalize": "finalize",
-            },
-        )
-        workflow.add_conditional_edges(
-            "selected_candidate_review",
-            self.route_after_selected_candidate_review,
-            {
-                "select_candidate": "select_candidate",
-                "fetch_feed": "fetch_feed",
                 "candidate_policy_guard": "candidate_policy_guard",
-                "blocked": "blocked",
                 "finalize": "finalize",
             },
         )
@@ -405,88 +446,6 @@ class AutomationGraph:
         if snapshot.candidate_refresh_pending:
             return "fetch_feed"
         return "prefilter_candidates"
-
-    async def moderate_candidates(self, state: AutomationGraphState) -> AutomationGraphState:
-        snapshot = state["snapshot"]
-        started_at = perf_counter()
-        if snapshot.status is RunStatus.FAILED:
-            return {"snapshot": snapshot}
-        if self.adapters.moderate_candidates is None or not snapshot.candidates:
-            return {"snapshot": snapshot}
-        try:
-            moderation_results = await maybe_await(self.adapters.moderate_candidates(snapshot))
-        except AIProviderError as exc:
-            snapshot.log_event(
-                "moderate_candidates",
-                "ai moderation failed",
-                error=str(exc),
-                duration_ms=round((perf_counter() - started_at) * 1000, 2),
-            )
-            snapshot.mark_failed(f"ai moderation failed: {exc}", node="moderate_candidates")
-            return {"snapshot": snapshot}
-        moderation_by_tweet_id = {result.tweet_id: result for result in moderation_results or []}
-        filtered_candidates: list[FeedCandidate] = []
-        filtered_count = 0
-        for candidate in snapshot.candidates:
-            if _is_moderation_exempt_candidate(candidate):
-                filtered_candidates.append(candidate)
-                continue
-            moderation = moderation_by_tweet_id.get(candidate.tweet_id)
-            if moderation is None:
-                filtered_count += 1
-                snapshot.log_event(
-                    "moderate_candidates",
-                    "candidate filtered by ai moderation",
-                    tweet_id=candidate.tweet_id,
-                    screen_name=candidate.screen_name,
-                    category="missing_decision",
-                    reason="candidate missing from ai moderation results",
-                )
-                continue
-            if not moderation.allowed:
-                filtered_count += 1
-                snapshot.log_event(
-                    "moderate_candidates",
-                    "candidate filtered by ai moderation",
-                    tweet_id=candidate.tweet_id,
-                    screen_name=candidate.screen_name,
-                    category=moderation.category,
-                    reason=moderation.reason,
-                )
-                continue
-            filtered_candidates.append(candidate)
-        snapshot.candidates = filtered_candidates
-        snapshot.log_event(
-            "moderate_candidates",
-            "ai moderation completed",
-            kept=len(filtered_candidates),
-            filtered=filtered_count,
-            duration_ms=round((perf_counter() - started_at) * 1000, 2),
-        )
-        if not snapshot.candidates:
-            if not self._schedule_candidate_refresh(
-                snapshot,
-                node="moderate_candidates",
-                reason="all candidates filtered by ai moderation",
-            ):
-                snapshot.log_event(
-                    "moderate_candidates",
-                    "candidate refresh limit reached",
-                    reason="all candidates filtered by ai moderation",
-                    attempts=snapshot.candidate_refresh_count,
-                )
-                snapshot.mark_blocked(["all candidates filtered by ai moderation"], node="moderate_candidates")
-        return {"snapshot": snapshot}
-
-    def route_after_moderation(self, state: AutomationGraphState) -> str:
-        snapshot = state["snapshot"]
-        if snapshot.status is RunStatus.BLOCKED:
-            return "blocked"
-        if snapshot.status is RunStatus.FAILED:
-            return "finalize"
-        if snapshot.candidate_refresh_pending:
-            return "fetch_feed"
-        return "shortlist_prepare_candidates"
 
     async def prefilter_candidates(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
@@ -586,24 +545,7 @@ class AutomationGraph:
             return "finalize"
         if snapshot.candidate_refresh_pending:
             return "fetch_feed"
-        if self.adapters.moderate_candidates is not None:
-            return "moderate_candidates"
-        return "shortlist_prepare_candidates"
-
-    async def shortlist_prepare_candidates(self, state: AutomationGraphState) -> AutomationGraphState:
-        snapshot = state["snapshot"]
-        if snapshot.status is RunStatus.FAILED:
-            return {"snapshot": snapshot}
-        if len(snapshot.candidates) > self.candidate_hydration_count:
-            original_count = len(snapshot.candidates)
-            snapshot.candidates = snapshot.candidates[: self.candidate_hydration_count]
-            snapshot.log_event(
-                "shortlist_prepare_candidates",
-                "candidate shortlist prepared",
-                kept=len(snapshot.candidates),
-                dropped=original_count - len(snapshot.candidates),
-            )
-        return {"snapshot": snapshot}
+        return "select_candidate"
 
     async def select_candidate(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
@@ -614,8 +556,9 @@ class AutomationGraph:
                 try:
                     selected = await maybe_await(self.adapters.select_candidate(snapshot))
                 except AIProviderError as exc:
-                    snapshot.log_event("select_candidate", "ai selection failed", error=str(exc))
-                    snapshot.mark_failed(f"ai selection failed: {exc}", node="select_candidate")
+                    metrics = snapshot.pop_runtime_observability("select_candidate")
+                    snapshot.log_event("select_candidate", "candidate evaluation failed", error=str(exc), **metrics)
+                    snapshot.mark_failed(f"candidate evaluation failed: {exc}", node="select_candidate")
                     return {"snapshot": snapshot}
                 if selected is not None:
                     snapshot.selected_candidate = selected
@@ -648,104 +591,6 @@ class AutomationGraph:
         snapshot = state["snapshot"]
         if snapshot.status is RunStatus.FAILED:
             return "finalize"
-        return "selected_candidate_review"
-
-    async def selected_candidate_review(self, state: AutomationGraphState) -> AutomationGraphState:
-        snapshot = state["snapshot"]
-        started_at = perf_counter()
-        if snapshot.status is RunStatus.FAILED:
-            return {"snapshot": snapshot}
-        if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE or snapshot.selected_candidate is None:
-            return {"snapshot": snapshot}
-        if self.adapters.selected_candidate_review is None:
-            return {"snapshot": snapshot}
-
-        try:
-            moderation = await maybe_await(self.adapters.selected_candidate_review(snapshot))
-        except AIProviderError as exc:
-            snapshot.log_event(
-                "selected_candidate_review",
-                "selected candidate review failed",
-                error=str(exc),
-                duration_ms=round((perf_counter() - started_at) * 1000, 2),
-            )
-            snapshot.mark_failed(f"ai moderation failed: {exc}", node="selected_candidate_review")
-            return {"snapshot": snapshot}
-
-        if moderation is None or moderation.allowed:
-            snapshot.log_event(
-                "selected_candidate_review",
-                "selected candidate passed full-text review",
-                tweet_id=snapshot.selected_candidate.tweet_id,
-                duration_ms=round((perf_counter() - started_at) * 1000, 2),
-            )
-            return {"snapshot": snapshot}
-
-        if _is_moderation_exempt_candidate(snapshot.selected_candidate):
-            snapshot.log_event(
-                "selected_candidate_review",
-                "selected candidate bypassed ai moderation",
-                tweet_id=snapshot.selected_candidate.tweet_id,
-                screen_name=snapshot.selected_candidate.screen_name,
-                category=moderation.category,
-                reason=moderation.reason,
-                duration_ms=round((perf_counter() - started_at) * 1000, 2),
-            )
-            return {"snapshot": snapshot}
-
-        snapshot.log_event(
-            "selected_candidate_review",
-            "selected candidate filtered by ai moderation",
-            tweet_id=snapshot.selected_candidate.tweet_id,
-            screen_name=snapshot.selected_candidate.screen_name,
-            category=moderation.category,
-            reason=moderation.reason,
-            duration_ms=round((perf_counter() - started_at) * 1000, 2),
-        )
-        if not snapshot.request.dry_run and hasattr(self.adapters.policy_hooks, "reject_candidate_cache"):
-            self.adapters.policy_hooks.reject_candidate_cache(
-                workflow="feed_engage",
-                tweet_id=snapshot.selected_candidate.tweet_id,
-                reason=moderation.reason,
-                expires_at=(datetime.now(UTC) + timedelta(minutes=self.config.policies.candidate_cache_rejected_ttl_minutes)).isoformat(),
-            )
-        remaining_candidates = [
-            candidate
-            for candidate in snapshot.candidates
-            if candidate.tweet_id != snapshot.selected_candidate.tweet_id
-        ]
-        if remaining_candidates:
-            blocked_candidate = snapshot.selected_candidate
-            snapshot.candidates = remaining_candidates
-            self._reset_after_candidate_rejection(snapshot)
-            snapshot.log_event(
-                "selected_candidate_review",
-                "candidate blocked after full-text review, trying next",
-                tweet_id=blocked_candidate.tweet_id,
-                screen_name=blocked_candidate.screen_name,
-                reason=moderation.reason,
-                remaining_candidates=len(snapshot.candidates),
-            )
-            return {"snapshot": snapshot}
-        if self._schedule_candidate_refresh(
-            snapshot,
-            node="selected_candidate_review",
-            reason=moderation.reason,
-        ):
-            return {"snapshot": snapshot}
-        snapshot.mark_blocked([moderation.reason], node="selected_candidate_review")
-        return {"snapshot": snapshot}
-
-    def route_after_selected_candidate_review(self, state: AutomationGraphState) -> str:
-        snapshot = state["snapshot"]
-        if snapshot.status is RunStatus.BLOCKED:
-            return "blocked"
-        if snapshot.status is RunStatus.FAILED:
-            return "finalize"
-        if snapshot.candidate_refresh_pending:
-            return "fetch_feed"
-        if snapshot.selected_candidate is None:
-            return "select_candidate"
         return "candidate_policy_guard"
 
     async def candidate_policy_guard(self, state: AutomationGraphState) -> AutomationGraphState:
@@ -817,6 +662,8 @@ class AutomationGraph:
         if not snapshot.policy.allowed:
             if not self._retry_blocked_candidate(snapshot):
                 snapshot.mark_blocked(snapshot.policy.reasons)
+        else:
+            self._release_unused_claimed_candidates(snapshot, node="policy_guard")
         return {"snapshot": snapshot}
 
     def route_after_policy(self, state: AutomationGraphState) -> str:
@@ -909,6 +756,38 @@ class AutomationGraph:
             remaining_candidates=len(snapshot.candidates),
         )
         return True
+
+    def _release_unused_claimed_candidates(self, snapshot: WorkflowStateModel, *, node: str) -> int:
+        if snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE or snapshot.selected_candidate is None:
+            return 0
+        release_claims = getattr(self.adapters.policy_hooks, "release_claimed_candidate_cache", None)
+        if not callable(release_claims):
+            return 0
+        releasable = [
+            candidate
+            for candidate in snapshot.candidates
+            if candidate.tweet_id != snapshot.selected_candidate.tweet_id
+            and isinstance(candidate.metadata, dict)
+            and candidate.metadata.get("_x_atuo_candidate_cache")
+            and candidate.metadata.get("_x_atuo_claim_run_id") == snapshot.run_id
+        ]
+        if not releasable:
+            return 0
+        tweet_ids = [candidate.tweet_id for candidate in releasable]
+        released = release_claims(
+            workflow="feed_engage",
+            run_id=snapshot.run_id,
+            tweet_ids=tweet_ids,
+        )
+        if released:
+            snapshot.candidates = [snapshot.selected_candidate]
+            snapshot.log_event(
+                node,
+                "unused claimed candidates released",
+                count=released,
+                tweet_ids=tweet_ids,
+            )
+        return released
 
     async def blocked(self, state: AutomationGraphState) -> AutomationGraphState:
         snapshot = state["snapshot"]
@@ -1021,8 +900,14 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                         created_at = datetime.fromisoformat(created_at_raw)
                     except ValueError:
                         created_at = None
-                metadata = dict(item.get("metadata") or {})
+                metadata = {
+                    key: value
+                    for key, value in dict(item.get("metadata") or {}).items()
+                    if not str(key).startswith("_x_atuo_")
+                }
                 metadata["_x_atuo_candidate_cache"] = True
+                if isinstance(item.get("claim_run_id"), str) and item.get("claim_run_id"):
+                    metadata["_x_atuo_claim_run_id"] = item["claim_run_id"]
                 candidates.append(
                     FeedCandidate(
                         tweet_id=str(item.get("tweet_id") or ""),
@@ -1073,7 +958,11 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         return [*with_created_at, *without_created_at]
 
     def build_hydrated_metadata(candidate: FeedCandidate, tweet: TweetRecord) -> dict[str, Any]:
+        previous = dict(candidate.metadata) if isinstance(candidate.metadata, dict) else {}
         raw = dict(tweet.raw) if isinstance(tweet.raw, dict) else {}
+        for key, value in previous.items():
+            if key.startswith("_x_atuo_") and key not in raw:
+                raw[key] = value
         author = raw.get("author")
         if not isinstance(author, dict):
             raw["author"] = {
@@ -1082,6 +971,17 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             }
         raw["_x_atuo_hydrated"] = True
         return raw
+
+    def apply_hydrated_tweet(candidate: FeedCandidate, tweet: TweetRecord) -> None:
+        candidate.screen_name = tweet.screen_name or candidate.screen_name
+        candidate.text = tweet.text or candidate.text
+        candidate.created_at = getattr(tweet, "created_at", None) or candidate.created_at
+        candidate.author_verified = tweet.verified
+        candidate.can_reply = getattr(tweet, "can_reply", None)
+        candidate.reply_limit_reason = getattr(tweet, "reply_limit_reason", None)
+        candidate.reply_limit_headline = getattr(tweet, "reply_limit_headline", None)
+        candidate.reply_restriction_policy = getattr(tweet, "reply_restriction_policy", None)
+        candidate.metadata = build_hydrated_metadata(candidate, tweet)
 
     def hydrate_selected_candidate(candidate: FeedCandidate | None) -> FeedCandidate | None:
         if candidate is None:
@@ -1096,36 +996,74 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             tweet = fetch_tweet(candidate.tweet_id)
         except Exception:
             return candidate
-        candidate.screen_name = tweet.screen_name or candidate.screen_name
-        candidate.text = tweet.text or candidate.text
-        candidate.created_at = getattr(tweet, "created_at", None) or candidate.created_at
-        candidate.author_verified = tweet.verified
-        candidate.can_reply = getattr(tweet, "can_reply", None)
-        candidate.reply_limit_reason = getattr(tweet, "reply_limit_reason", None)
-        candidate.reply_limit_headline = getattr(tweet, "reply_limit_headline", None)
-        candidate.reply_restriction_policy = getattr(tweet, "reply_restriction_policy", None)
-        candidate.metadata = build_hydrated_metadata(candidate, tweet)
+        apply_hydrated_tweet(candidate, tweet)
         return candidate
 
-    def draft_reply(snapshot: WorkflowStateModel):
+    async def hydrate_candidates(
+        snapshot: WorkflowStateModel,
+        candidates: list[FeedCandidate],
+        *,
+        node: str,
+    ) -> dict[str, Any]:
+        hydration_started_at = perf_counter()
+        reused_hydrated_count = 0
+
+        async def hydrate_candidate(candidate: FeedCandidate) -> tuple[FeedCandidate, TweetRecord | None, Exception | None]:
+            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+            if metadata.get("_x_atuo_hydrated"):
+                return candidate, None, None
+            try:
+                tweet = await asyncio.to_thread(service.client.fetch_tweet, candidate.tweet_id)
+                return candidate, tweet, None
+            except Exception as exc:
+                return candidate, None, exc
+
+        hydrated = await asyncio.gather(*(hydrate_candidate(candidate) for candidate in candidates))
+        for candidate, tweet, exc in hydrated:
+            if exc is not None:
+                snapshot.log_event(
+                    node,
+                    "candidate hydration failed before selection, using preview",
+                    tweet_id=candidate.tweet_id,
+                    error=str(exc),
+                )
+                continue
+            if tweet is None:
+                metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+                if metadata.get("_x_atuo_hydrated"):
+                    reused_hydrated_count += 1
+                continue
+            apply_hydrated_tweet(candidate, tweet)
+
+        return {
+            "hydrated_count": len(candidates),
+            "reused_hydrated_count": reused_hydrated_count,
+            "hydration_duration_ms": _elapsed_ms(hydration_started_at),
+        }
+
+    async def draft_reply(snapshot: WorkflowStateModel):
         started_at = perf_counter()
         candidate = snapshot.selected_candidate
         if candidate is not None:
-            hydrate_selected_candidate(candidate)
+            await asyncio.to_thread(hydrate_selected_candidate, candidate)
         reply_context = snapshot.reply_context if isinstance(snapshot.reply_context, dict) else {}
         reply_style = _rule_based_reply_style(candidate)
         style_reason = "rule_based" if reply_style is not None else ""
+        style_duration_ms: float | None = None
         if reply_style is None and candidate is not None:
             classifier = getattr(ai_provider, "classify_reply_style", None)
             if classifier is not None:
+                style_started_at = perf_counter()
                 try:
-                    decision = classifier(candidate)
+                    decision = await asyncio.to_thread(classifier, candidate)
                     reply_style = getattr(decision, "style", None) or "technical"
                     style_reason = getattr(decision, "reason", "") or "ai_classified"
                 except AIProviderError as exc:
                     snapshot.log_event("draft_reply", "reply style classification failed", error=str(exc))
                     reply_style = "technical"
                     style_reason = "classification_failed"
+                finally:
+                    style_duration_ms = _elapsed_ms(style_started_at)
         if reply_style is None:
             reply_style = "technical"
             style_reason = "default"
@@ -1143,97 +1081,54 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         )
         if snapshot.selected_candidate is None:
             raise AIProviderError("draft requested without a selected candidate")
-        draft = _call_with_optional_context(
+        draft_started_at = perf_counter()
+        draft = await asyncio.to_thread(
+            _call_with_optional_context,
             ai_provider.draft_reply,
             snapshot.selected_candidate,
             {"reply_style": reply_style},
         )
         snapshot.drafting_source = "ai"
-        snapshot.log_event(
-            "draft_reply",
-            "base ai draft generated",
-            rationale=draft.rationale,
-            duration_ms=round((perf_counter() - started_at) * 1000, 2),
-        )
+        payload = {
+            "rationale": draft.rationale,
+            "duration_ms": _elapsed_ms(started_at),
+            "ai_draft_duration_ms": _elapsed_ms(draft_started_at),
+            "ai_draft_input_bytes": _draft_payload_bytes(snapshot.selected_candidate),
+        }
+        if style_duration_ms is not None:
+            payload["ai_style_classification_duration_ms"] = style_duration_ms
+        snapshot.log_event("draft_reply", "base ai draft generated", **payload)
         return draft.text
 
     async def select_candidate(snapshot: WorkflowStateModel):
-        hydration_started_at = perf_counter()
-        reused_hydrated_count = 0
+        moderate = getattr(ai_provider, "moderate_candidates", None)
+        if moderate is None:
+            raise AIProviderError("feed-engage requires ai moderation adapter")
 
-        async def hydrate_candidate(candidate: FeedCandidate) -> tuple[FeedCandidate, TweetRecord | None, Exception | None]:
-            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
-            if metadata.get("_x_atuo_hydrated"):
-                return candidate, None, None
-            try:
-                tweet = await asyncio.to_thread(service.client.fetch_tweet, candidate.tweet_id)
-                return candidate, tweet, None
-            except Exception as exc:
-                return candidate, None, exc
+        original_candidates = list(snapshot.candidates)
+        if not original_candidates:
+            snapshot.stash_runtime_observability("select_candidate")
+            return None
 
-        hydrated = await asyncio.gather(*(hydrate_candidate(candidate) for candidate in snapshot.candidates))
-        for candidate, tweet, exc in hydrated:
-            if exc is not None:
-                snapshot.log_event(
-                    "select_candidate",
-                    "candidate hydration failed before selection, using preview",
-                    tweet_id=candidate.tweet_id,
-                    error=str(exc),
-                )
-                continue
-            if tweet is None:
-                metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
-                if metadata.get("_x_atuo_hydrated"):
-                    reused_hydrated_count += 1
-                continue
-            candidate.screen_name = tweet.screen_name or candidate.screen_name
-            candidate.text = tweet.text or candidate.text
-            candidate.created_at = getattr(tweet, "created_at", None) or candidate.created_at
-            candidate.author_verified = tweet.verified
-            candidate.can_reply = getattr(tweet, "can_reply", None)
-            candidate.reply_limit_reason = getattr(tweet, "reply_limit_reason", None)
-            candidate.reply_limit_headline = getattr(tweet, "reply_limit_headline", None)
-            candidate.reply_restriction_policy = getattr(tweet, "reply_restriction_policy", None)
-            candidate.metadata = build_hydrated_metadata(candidate, tweet)
-
-        allowed_candidates: list[FeedCandidate] = []
+        total_hydrated_count = 0
+        total_reused_hydrated_count = 0
+        total_hydration_duration_ms = 0.0
+        ai_moderation_duration_total = 0.0
+        ai_moderation_candidate_count = 0
+        ai_moderation_cache_hits = 0
+        ai_moderation_input_bytes = 0
         risky_candidates: list[FeedCandidate] = []
-        for candidate in snapshot.candidates:
-            if candidate.can_reply is False:
-                snapshot.log_event(
-                    "select_candidate",
-                    "candidate removed after hydration",
-                    tweet_id=candidate.tweet_id,
-                    screen_name=candidate.screen_name,
-                    reason=(candidate.reply_limit_reason or candidate.reply_limit_headline or "reply restricted"),
-                )
-                continue
-            if candidate.reply_restriction_policy:
-                snapshot.log_event(
-                    "select_candidate",
-                    "candidate de-prioritized after hydration",
-                    tweet_id=candidate.tweet_id,
-                    screen_name=candidate.screen_name,
-                    policy=candidate.reply_restriction_policy,
-                    reason=(candidate.reply_limit_reason or _reply_control_reason(candidate.reply_restriction_policy)),
-                )
-                risky_candidates.append(candidate)
-                continue
-            allowed_candidates.append(candidate)
-        snapshot.candidates = [*allowed_candidates, *risky_candidates]
-        snapshot.stash_runtime_observability(
-            "select_candidate",
-            hydrated_count=len(snapshot.candidates),
-            reused_hydrated_count=reused_hydrated_count,
-            hydration_duration_ms=round((perf_counter() - hydration_started_at) * 1000, 2),
-        )
-        if (
-            not snapshot.request.dry_run
-            and snapshot.request.workflow is WorkflowKind.FEED_ENGAGE
-            and not snapshot.candidate_cache_persisted
-            and snapshot.candidates
-            and hasattr(storage, "upsert_candidate_cache_entries")
-        ):
+        reject_candidate_cache = getattr(storage, "reject_candidate_cache", None)
+
+        def persist_candidate_pool() -> None:
+            if (
+                snapshot.request.dry_run
+                or snapshot.request.workflow is not WorkflowKind.FEED_ENGAGE
+                or snapshot.candidate_cache_persisted
+                or not snapshot.candidates
+                or not hasattr(storage, "upsert_candidate_cache_entries")
+            ):
+                return
             expires_at = (datetime.now(UTC) + timedelta(minutes=config.policies.candidate_cache_pending_ttl_minutes)).isoformat()
             storage.upsert_candidate_cache_entries(
                 workflow="feed_engage",
@@ -1244,51 +1139,178 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
             snapshot.candidate_cache_persisted = True
             snapshot.log_event(
                 "select_candidate",
-                "candidate shortlist cached",
+                "candidate pool cached",
                 count=len(snapshot.candidates),
                 expires_at=expires_at,
             )
-        if not snapshot.candidates:
-            return None
-        selection = ai_provider.select_candidate(snapshot.candidates)
-        for candidate in snapshot.candidates:
-            if candidate.tweet_id == selection.tweet_id:
-                snapshot.selection_source = "ai"
-                snapshot.selection_reason = selection.reason
-                return candidate
-        raise AIProviderError("ai selection returned a candidate outside the shortlist")
 
-    async def moderate_candidates(snapshot: WorkflowStateModel):
-        if ai_provider is None or not snapshot.candidates:
-            return []
-        moderate = getattr(ai_provider, "moderate_candidates", None)
-        if moderate is None:
-            return []
-        return list(moderate(snapshot.candidates))
+        async def hydrate_one(candidate: FeedCandidate) -> None:
+            nonlocal total_hydrated_count
+            nonlocal total_reused_hydrated_count
+            nonlocal total_hydration_duration_ms
+            metrics = await hydrate_candidates(snapshot, [candidate], node="select_candidate")
+            total_hydrated_count += int(metrics.get("hydrated_count", 0))
+            total_reused_hydrated_count += int(metrics.get("reused_hydrated_count", 0))
+            total_hydration_duration_ms += float(metrics.get("hydration_duration_ms", 0.0))
 
-    async def selected_candidate_review(snapshot: WorkflowStateModel):
-        if ai_provider is None or snapshot.selected_candidate is None:
-            return None
-        moderate = getattr(ai_provider, "moderate_candidates", None)
-        if moderate is None:
-            return None
-        results = list(moderate([snapshot.selected_candidate]))
-        if not results:
-            return AIModerationResult(
-                tweet_id=snapshot.selected_candidate.tweet_id,
-                allowed=False,
-                category="missing_decision",
-                reason="selected candidate missing from ai moderation results",
+        def candidate_reply_disposition(candidate: FeedCandidate) -> str:
+            if candidate.can_reply is False:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate removed after hydration",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    reason=(candidate.reply_limit_reason or candidate.reply_limit_headline or "reply restricted"),
+                )
+                return "skip"
+            if candidate.reply_restriction_policy:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate de-prioritized after hydration",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    policy=candidate.reply_restriction_policy,
+                    reason=(candidate.reply_limit_reason or _reply_control_reason(candidate.reply_restriction_policy)),
+                )
+                return "risky"
+            return "eligible"
+
+        async def moderate_one(candidate: FeedCandidate) -> AIModerationResult | None:
+            nonlocal ai_moderation_duration_total
+            nonlocal ai_moderation_candidate_count
+            nonlocal ai_moderation_cache_hits
+            nonlocal ai_moderation_input_bytes
+            if _is_moderation_exempt_candidate(candidate):
+                return None
+            cached = _cached_ai_moderation(
+                candidate,
+                provider_name=config.ai.provider,
+                model_name=config.ai.model,
             )
-        match = next((result for result in results if result.tweet_id == snapshot.selected_candidate.tweet_id), None)
-        if match is None:
-            return AIModerationResult(
-                tweet_id=snapshot.selected_candidate.tweet_id,
-                allowed=False,
-                category="missing_decision",
-                reason="selected candidate missing from ai moderation results",
+            if cached is not None:
+                ai_moderation_cache_hits += 1
+                return cached
+            moderation_started_at = perf_counter()
+            ai_moderation_candidate_count += 1
+            ai_moderation_input_bytes += _moderation_payload_bytes([candidate])
+            results = list(await asyncio.to_thread(moderate, [candidate]))
+            ai_moderation_duration_total += perf_counter() - moderation_started_at
+            if not results:
+                moderation = AIModerationResult(
+                    tweet_id=candidate.tweet_id,
+                    allowed=False,
+                    category="missing_decision",
+                    reason="selected candidate missing from ai moderation results",
+                )
+                _store_ai_moderation(
+                    candidate,
+                    moderation,
+                    provider_name=config.ai.provider,
+                    model_name=config.ai.model,
+                )
+                return moderation
+            match = next((result for result in results if result.tweet_id == candidate.tweet_id), None)
+            if match is None:
+                moderation = AIModerationResult(
+                    tweet_id=candidate.tweet_id,
+                    allowed=False,
+                    category="missing_decision",
+                    reason="selected candidate missing from ai moderation results",
+                )
+                _store_ai_moderation(
+                    candidate,
+                    moderation,
+                    provider_name=config.ai.provider,
+                    model_name=config.ai.model,
+                )
+                return moderation
+            _store_ai_moderation(
+                candidate,
+                match,
+                provider_name=config.ai.provider,
+                model_name=config.ai.model,
             )
-        return match
+            return match
+
+        def stash_metrics() -> None:
+            snapshot.stash_runtime_observability(
+                "select_candidate",
+                hydrated_count=total_hydrated_count,
+                reused_hydrated_count=total_reused_hydrated_count,
+                hydration_duration_ms=round(total_hydration_duration_ms, 2),
+                ai_moderation_duration_ms=round(ai_moderation_duration_total * 1000, 2),
+                ai_moderation_candidate_count=ai_moderation_candidate_count,
+                ai_moderation_cache_hits=ai_moderation_cache_hits,
+                ai_moderation_input_bytes=ai_moderation_input_bytes,
+            )
+
+        for index, candidate in enumerate(original_candidates):
+            await hydrate_one(candidate)
+            disposition = candidate_reply_disposition(candidate)
+            if disposition == "skip":
+                continue
+            if disposition == "risky":
+                risky_candidates.append(candidate)
+                continue
+
+            moderation = await moderate_one(candidate)
+            if moderation is not None and not moderation.allowed:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate filtered by ai moderation",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    category=moderation.category,
+                    reason=moderation.reason,
+                )
+                if not snapshot.request.dry_run and callable(reject_candidate_cache):
+                    reject_candidate_cache(
+                        workflow="feed_engage",
+                        tweet_id=candidate.tweet_id,
+                        reason=moderation.reason,
+                        expires_at=(datetime.now(UTC) + timedelta(minutes=config.policies.candidate_cache_rejected_ttl_minutes)).isoformat(),
+                    )
+                continue
+
+            snapshot.selected_candidate = candidate
+            snapshot.selection_source = "ordered_candidates"
+            snapshot.selection_reason = "first ordered candidate passed sequential validation"
+            snapshot.candidates = [candidate, *original_candidates[index + 1 :], *risky_candidates]
+            persist_candidate_pool()
+            stash_metrics()
+            return candidate
+
+        for index, candidate in enumerate(risky_candidates):
+            moderation = await moderate_one(candidate)
+            if moderation is not None and not moderation.allowed:
+                snapshot.log_event(
+                    "select_candidate",
+                    "candidate filtered by ai moderation",
+                    tweet_id=candidate.tweet_id,
+                    screen_name=candidate.screen_name,
+                    category=moderation.category,
+                    reason=moderation.reason,
+                )
+                if not snapshot.request.dry_run and callable(reject_candidate_cache):
+                    reject_candidate_cache(
+                        workflow="feed_engage",
+                        tweet_id=candidate.tweet_id,
+                        reason=moderation.reason,
+                        expires_at=(datetime.now(UTC) + timedelta(minutes=config.policies.candidate_cache_rejected_ttl_minutes)).isoformat(),
+                    )
+                continue
+
+            snapshot.selected_candidate = candidate
+            snapshot.selection_source = "ordered_candidates"
+            snapshot.selection_reason = "first ordered candidate passed sequential validation"
+            snapshot.candidates = [candidate, *risky_candidates[index + 1 :]]
+            persist_candidate_pool()
+            stash_metrics()
+            return candidate
+
+        snapshot.candidates = []
+        stash_metrics()
+        return None
 
     def execute_engage(snapshot: WorkflowStateModel):
         candidate = snapshot.selected_candidate
@@ -1368,9 +1390,7 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         config,
         WorkflowAdapters(
             fetch_feed=fetch_feed,
-            moderate_candidates=moderate_candidates if getattr(ai_provider, "moderate_candidates", None) is not None else None,
             select_candidate=select_candidate,
-            selected_candidate_review=selected_candidate_review if getattr(ai_provider, "moderate_candidates", None) is not None else None,
             draft_reply=draft_reply,
             execute_engage=execute_engage,
             policy_hooks=storage,

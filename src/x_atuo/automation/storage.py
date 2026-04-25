@@ -24,6 +24,14 @@ def _deserialize_json(value: str | None) -> Any:
     return json.loads(value)
 
 
+def _strip_internal_metadata(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: item
+        for key, item in value.items()
+        if not str(key).startswith("_x_atuo_")
+    }
+
+
 class AutomationStorage:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
@@ -323,8 +331,7 @@ class AutomationStorage:
         now = utcnow()
         with self.connect() as connection:
             for candidate in candidates:
-                metadata = dict(candidate.get("metadata") or {})
-                metadata["_x_atuo_candidate_cache"] = True
+                metadata = _strip_internal_metadata(dict(candidate.get("metadata") or {}))
                 connection.execute(
                     """
                     INSERT INTO candidate_cache (
@@ -457,6 +464,29 @@ class AutomationStorage:
             }
             for row in rows
         ]
+
+    def release_claimed_candidate_cache(
+        self,
+        *,
+        workflow: str,
+        run_id: str,
+        tweet_ids: list[str],
+    ) -> int:
+        if not tweet_ids:
+            return 0
+        now = utcnow()
+        placeholders = ", ".join("?" for _ in tweet_ids)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                UPDATE candidate_cache
+                SET status = 'pending', claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+                WHERE workflow = ? AND claim_run_id = ? AND status = 'claimed' AND tweet_id IN ({placeholders})
+                """,
+                (now, workflow, run_id, *tweet_ids),
+            )
+            return int(cursor.rowcount or 0)
 
     def reject_candidate_cache(self, *, workflow: str, tweet_id: str, reason: str, expires_at: str) -> None:
         with self.connect() as connection:

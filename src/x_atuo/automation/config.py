@@ -22,7 +22,7 @@ class TwitterRuntimeConfig(BaseModel):
 
 
 class AISettings(BaseModel):
-    """Config for optional AI-backed selection and drafting."""
+    """Config for optional AI-backed moderation and drafting."""
 
     provider: Literal["none", "mock", "openai_compatible"] = "none"
     model: str | None = None
@@ -37,7 +37,6 @@ class PolicyConfig(BaseModel):
     max_post_length: int = 280
     max_reply_length: int = 280
     candidate_refresh_rounds: int = 2
-    candidate_hydration_count: int = 3
     candidate_cache_pending_ttl_minutes: int = 60
     candidate_cache_rejected_ttl_minutes: int = 1440
     candidate_cache_claim_ttl_minutes: int = 10

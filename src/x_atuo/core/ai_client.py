@@ -1,9 +1,10 @@
-"""Optional AI providers for selection and drafting."""
+"""Optional AI providers for moderation and drafting."""
 
 from __future__ import annotations
 
 import json
 import re
+from hashlib import sha256
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -15,12 +16,6 @@ from x_atuo.automation.state import FeedCandidate
 
 class AIProviderError(RuntimeError):
     """Raised when an AI provider cannot complete a request."""
-
-
-@dataclass(slots=True, frozen=True)
-class AISelectionResult:
-    tweet_id: str
-    reason: str
 
 
 @dataclass(slots=True, frozen=True)
@@ -44,9 +39,6 @@ class AIReplyStyleDecision:
 
 
 class BaseAIProvider:
-    def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
-        raise NotImplementedError
-
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         raise NotImplementedError
 
@@ -55,6 +47,9 @@ class BaseAIProvider:
 
     def classify_reply_style(self, candidate: FeedCandidate) -> AIReplyStyleDecision:
         raise NotImplementedError
+
+
+_AI_MODERATION_CACHE_VERSION = "2026-04-24"
 
 
 def _compact_candidate_payload(
@@ -89,17 +84,64 @@ def _compact_candidate_payload(
     return compact
 
 
+def build_moderation_candidate_payload(candidate_payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = {
+        key: candidate_payload[key]
+        for key in (
+            "tweet_id",
+            "screen_name",
+            "text",
+            "created_at",
+            "author_verified",
+            "can_reply",
+            "reply_limit_reason",
+            "reply_limit_headline",
+            "reply_restriction_policy",
+        )
+        if candidate_payload.get(key) is not None
+    }
+    compact = _compact_candidate_payload(candidate_payload, include_media_types=True)
+    media_types = compact.get("media_types")
+    if isinstance(media_types, list) and media_types:
+        normalized["media_types"] = media_types
+    return normalized
+
+
+def build_moderation_prompt_payload(candidates: list[FeedCandidate]) -> list[dict[str, Any]]:
+    return [
+        build_moderation_candidate_payload(candidate.model_dump(mode="json"))
+        for candidate in candidates
+    ]
+
+
+def build_moderation_cache_key(
+    candidate: FeedCandidate,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> str:
+    seed = {
+        "version": _AI_MODERATION_CACHE_VERSION,
+        "provider": provider or "",
+        "model": model or "",
+        "candidate": build_moderation_candidate_payload(candidate.model_dump(mode="json")),
+    }
+    return sha256(
+        json.dumps(seed, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def build_draft_prompt_payload(candidate: FeedCandidate) -> dict[str, Any]:
+    return {
+        "candidate": _compact_candidate_payload(
+            candidate.model_dump(mode="json"),
+            include_media_types=True,
+        )
+    }
+
+
 class MockAIProvider(BaseAIProvider):
     """Mock provider for local testing and local AI-shaped flows."""
-
-    def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
-        if not candidates:
-            raise AIProviderError("No candidates available")
-        selected = max(candidates, key=lambda item: len(item.text or ""))
-        return AISelectionResult(
-            tweet_id=selected.tweet_id,
-            reason="mock provider selected the richest candidate text",
-        )
 
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         return [
@@ -175,21 +217,10 @@ class OpenAICompatibleProvider(BaseAIProvider):
             raise AIProviderError(f"Expected JSON object response, got: {type(parsed)!r}")
         return parsed
 
-    def select_candidate(self, candidates: list[FeedCandidate]) -> AISelectionResult:
-        content = self._chat(
-            "Select one Twitter candidate for engagement. Return JSON with tweet_id and reason. Keep the reason short, plain-English, and matched to the post itself instead of forcing technical framing.",
-            json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
-        )
-        try:
-            parsed = self._parse_json_content(content)
-            return AISelectionResult(tweet_id=str(parsed["tweet_id"]), reason=str(parsed.get("reason") or ""))
-        except (KeyError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError(f"Could not parse AI selection response: {content}") from exc
-
     def moderate_candidates(self, candidates: list[FeedCandidate]) -> list[AIModerationResult]:
         content = self._chat(
             "Review Twitter feed candidates for reply safety. Reject anything about crime, violence, fraud, scams, drugs, war, military conflict, law enforcement, case news, adult or NSFW content, hate or harassment, self-harm or dangerous behavior, gambling or illicit activity, extremism, crypto shilling or guaranteed-profit investment claims, and medical or legal high-risk advice. Allow technical, product, engineering, builder, developer-adjacent, pets and animals, lifestyle, food, travel, scenic photography, entertainment, memes, and casual social content. Always allow posts from @elonmusk. Return JSON with a results array of {tweet_id, allowed, category, reason}.",
-            json.dumps([item.model_dump(mode="json") for item in candidates], ensure_ascii=False),
+            json.dumps(build_moderation_prompt_payload(candidates), ensure_ascii=False),
         )
         try:
             parsed = self._parse_json_content(content)
@@ -247,12 +278,7 @@ class OpenAICompatibleProvider(BaseAIProvider):
                 "Keep it natural and human, with one light judgment or observation. Use plain language and avoid heavy technical framing unless the post clearly invites it. "
                 "One or two short sentences. Prefer statements over questions. No lists. No emojis. Return JSON with text and rationale."
             )
-        user_payload: dict[str, Any] = {
-            "candidate": _compact_candidate_payload(
-                candidate.model_dump(mode="json"),
-                include_media_types=True,
-            )
-        }
+        user_payload = build_draft_prompt_payload(candidate)
         content = self._chat(system, json.dumps(user_payload, ensure_ascii=False))
         try:
             parsed = self._parse_json_content(content)
