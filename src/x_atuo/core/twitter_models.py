@@ -35,6 +35,13 @@ class TweetRecord:
     text: str
     author: TweetAuthor
     created_at: datetime | None = None
+    article_title: str | None = None
+    article_text: str | None = None
+    conversation_id: str | None = None
+    reply_to_tweet_id: str | None = None
+    reply_to_screen_name: str | None = None
+    target_tweet_id: str | None = None
+    target_screen_name: str | None = None
     can_reply: bool | None = None
     reply_limit_reason: str | None = None
     reply_limit_headline: str | None = None
@@ -55,6 +62,46 @@ class TweetRecord:
                 raw=dict(author) if isinstance(author, dict) else {},
             ),
             created_at=_parse_payload_datetime(payload),
+            article_title=_coerce_optional_str(
+                payload.get("articleTitle")
+                or payload.get("article_title")
+            ),
+            article_text=_coerce_optional_str(
+                payload.get("articleText")
+                or payload.get("article_text")
+            ),
+            conversation_id=_coerce_optional_str(
+                payload.get("conversationId")
+                or payload.get("conversation_id")
+                or payload.get("conversation_id_str")
+            ),
+            reply_to_tweet_id=_coerce_optional_str(
+                payload.get("replyToTweetId")
+                or payload.get("reply_to_tweet_id")
+                or payload.get("reply_to_id")
+                or payload.get("replyingToId")
+                or payload.get("inReplyToTweetId")
+                or payload.get("in_reply_to_status_id_str")
+            ),
+            reply_to_screen_name=_coerce_optional_str(
+                payload.get("replyToScreenName")
+                or payload.get("reply_to_screen_name")
+                or payload.get("replyingToScreenName")
+                or payload.get("inReplyToScreenName")
+                or payload.get("in_reply_to_screen_name")
+            ),
+            target_tweet_id=_coerce_optional_str(
+                payload.get("targetTweetId")
+                or payload.get("target_tweet_id")
+                or payload.get("originalTargetTweetId")
+                or payload.get("original_target_tweet_id")
+            ),
+            target_screen_name=_coerce_optional_str(
+                payload.get("targetScreenName")
+                or payload.get("target_screen_name")
+                or payload.get("originalTargetScreenName")
+                or payload.get("original_target_screen_name")
+            ),
             can_reply=_coerce_optional_bool(payload.get("canReply", payload.get("can_reply"))),
             reply_limit_reason=_coerce_optional_str(payload.get("replyLimitReason", payload.get("reply_limit_reason"))),
             reply_limit_headline=_coerce_optional_str(payload.get("replyLimitHeadline", payload.get("reply_limit_headline"))),
@@ -125,7 +172,7 @@ class Candidate:
 
 @dataclass(slots=True, frozen=True)
 class TwitterCommandResult:
-    action: Literal["reply", "follow"]
+    action: Literal["reply", "follow", "retweet", "unretweet", "like", "unlike", "bookmark", "unbookmark", "delete"]
     ok: bool
     dry_run: bool = False
     target_tweet_id: str | None = None

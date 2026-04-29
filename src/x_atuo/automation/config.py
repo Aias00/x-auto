@@ -63,6 +63,37 @@ class SchedulerSettings(BaseModel):
     feed_engage_day_of_week: str | None = None
 
 
+class AuthorAlphaSettings(BaseModel):
+    """Independent settings for the author-alpha workflow lane."""
+
+    enabled: bool = False
+    autostart: bool = False
+    db_path: str = "data/author_alpha.sqlite3"
+    timezone: str = "Asia/Shanghai"
+    excluded_authors: list[str] = Field(default_factory=list)
+    trigger: Literal["interval", "cron"] = "interval"
+    seconds: int = 3600
+    jitter_seconds: int = 300
+    minute: str | None = None
+    hour: str | None = None
+    score_lookback_days: int = 7
+    score_min_daily_replies: int = 400
+    score_prior_weight: float = 7.0
+    score_penalty_constant: float = 200.0
+    device_follow_feed_count: int = 50
+    daily_execution_limit: int = 700
+    global_send_limit_15m: int = 50
+    per_author_daily_success_limit: int = 100
+    per_target_tweet_success_limit: int = 4
+    target_revisit_cooldown_seconds: int = 3600
+    max_targets_per_run: int = 5
+    per_run_same_target_burst_limit: int = 2
+    posts_per_author: int = 1
+    author_cooldown_seconds: int = 3
+    inter_reply_delay_seconds: int = 5
+    target_switch_delay_seconds: int = 10
+
+
 class JobConfig(BaseModel):
     """Persisted job defaults for webhook- or schedule-triggered workflows."""
 
@@ -93,6 +124,7 @@ class AutomationConfig(BaseSettings):
     ai: AISettings = Field(default_factory=AISettings)
     policies: PolicyConfig = Field(default_factory=PolicyConfig)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
+    author_alpha: AuthorAlphaSettings = Field(default_factory=AuthorAlphaSettings)
     jobs: dict[str, JobConfig] = Field(default_factory=dict)
 
     @property

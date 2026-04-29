@@ -20,6 +20,7 @@ class WorkflowKind(str, Enum):
     """Supported workflow types."""
 
     FEED_ENGAGE = "feed-engage"
+    AUTHOR_ALPHA_ENGAGE = "author-alpha-engage"
 
 
 class RunStatus(str, Enum):
@@ -111,6 +112,8 @@ class AutomationRequest(BaseModel):
             self.approval_mode = "ai_auto"
             if self.feed_options is None:
                 self.feed_options = FeedOptions()
+        elif self.workflow is WorkflowKind.AUTHOR_ALPHA_ENGAGE:
+            self.feed_options = None
         return self
 
     @classmethod
@@ -125,6 +128,20 @@ class AutomationRequest(BaseModel):
             workflow=WorkflowKind.FEED_ENGAGE,
             reply_text=reply_text,
             feed_options=feed_options or FeedOptions(),
+            **kwargs,
+        )
+
+    @classmethod
+    def for_author_alpha_engage(
+        cls,
+        *,
+        reply_text: str | None = None,
+        **kwargs: Any,
+    ) -> "AutomationRequest":
+        return cls(
+            workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE,
+            reply_text=reply_text,
+            feed_options=None,
             **kwargs,
         )
 

@@ -15,6 +15,9 @@ dependencies = [
   "pydantic>=2.8",
   "pydantic-settings>=2.4",
   "pyyaml>=6.0",
+  "curl_cffi>=0.7",
+  "xclienttransaction>=1.0.1",
+  "beautifulsoup4>=4.12",
 ]
 
 [project.optional-dependencies]

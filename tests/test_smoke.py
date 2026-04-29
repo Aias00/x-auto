@@ -33,7 +33,7 @@ from x_atuo.core.ai_client import OpenAICompatibleProvider
 from x_atuo.core.ai_client import build_moderation_cache_key
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_client import TwitterCredentials
-from x_atuo.core.twitter_models import TweetRecord
+from x_atuo.core.twitter_models import TweetAuthor, TweetRecord, TwitterCommandResult
 
 
 def test_dedupe_key_is_stable() -> None:
@@ -42,13 +42,39 @@ def test_dedupe_key_is_stable() -> None:
 
 
 def test_daily_execution_limit_disabled_by_default() -> None:
-    config = AutomationConfig()
+    config = AutomationConfig(_env_file=None)
     assert config.policies.daily_execution_limit is None
 
 
 def test_author_cooldown_disabled_by_default() -> None:
-    config = AutomationConfig()
+    config = AutomationConfig(_env_file=None)
     assert config.policies.per_author_cooldown_minutes is None
+
+
+def test_author_alpha_config_defaults() -> None:
+    config = AutomationConfig(_env_file=None)
+
+    assert config.author_alpha.enabled is False
+    assert config.author_alpha.excluded_authors == []
+    assert config.author_alpha.device_follow_feed_count == 50
+    assert config.author_alpha.daily_execution_limit == 700
+    assert config.author_alpha.global_send_limit_15m == 50
+    assert config.author_alpha.posts_per_author == 1
+    assert config.author_alpha.target_revisit_cooldown_seconds == 3600
+    assert config.author_alpha.max_targets_per_run == 5
+    assert config.author_alpha.per_run_same_target_burst_limit == 2
+    assert config.author_alpha.inter_reply_delay_seconds == 5
+    assert config.author_alpha.target_switch_delay_seconds == 10
+    assert config.author_alpha.score_min_daily_replies == 400
+    assert config.author_alpha.score_prior_weight == 7.0
+    assert config.author_alpha.score_penalty_constant == 200.0
+
+
+def test_author_alpha_request_builder_exists() -> None:
+    request = AutomationRequest.for_author_alpha_engage(job_name="job")
+
+    assert request.workflow.value == "author-alpha-engage"
+    assert request.job_name == "job"
 
 
 def test_local_dotenv_overrides_shell_env(tmp_path: Path, monkeypatch) -> None:
@@ -414,18 +440,41 @@ def test_tweet_record_parses_reply_limit_fields() -> None:
 
 def test_twitter_client_fetch_tweet_records_conversation_policy_as_risk() -> None:
     class LocalTwitterClient(TwitterClient):
-        def _run_json(self, args, *, allow_error_payload=False):
-            return type("Exec", (), {
-                "payload": {
-                    "data": [
-                        {
-                            "id": "111",
-                            "text": "hello",
-                            "author": {"screenName": "demo", "verified": True},
-                        }
-                    ]
-                }
-            })()
+        def _build_native_client(self):
+            class NativeAuthor:
+                id = "user-1"
+                name = "Demo"
+                screen_name = "demo"
+                profile_image_url = ""
+                verified = True
+
+            class NativeMetrics:
+                likes = 0
+                retweets = 0
+                replies = 0
+                quotes = 0
+                views = 0
+                bookmarks = 0
+
+            class NativeTweet:
+                id = "111"
+                text = "hello"
+                author = NativeAuthor()
+                metrics = NativeMetrics()
+                created_at = "2026-04-29T00:00:00+00:00"
+                media = []
+                urls = []
+                is_retweet = False
+                lang = "en"
+                retweeted_by = None
+                quoted_tweet = None
+                score = None
+                article_title = None
+                article_text = None
+                is_subscriber_only = False
+                is_promoted = False
+
+            return type("NativeClient", (), {"fetch_tweet_detail": lambda self_, tweet_id, count=1: [NativeTweet()]})()
 
         def _fetch_tweet_detail_payload(self, tweet_id: str):
             return {
@@ -473,18 +522,41 @@ def test_twitter_client_fetch_tweet_records_conversation_policy_as_risk() -> Non
 
 def test_twitter_client_fetch_tweet_locally_enriches_reply_limit() -> None:
     class LocalTwitterClient(TwitterClient):
-        def _run_json(self, args, *, allow_error_payload=False):
-            return type("Exec", (), {
-                "payload": {
-                    "data": [
-                        {
-                            "id": "111",
-                            "text": "hello",
-                            "author": {"screenName": "demo", "verified": True},
-                        }
-                    ]
-                }
-            })()
+        def _build_native_client(self):
+            class NativeAuthor:
+                id = "user-1"
+                name = "Demo"
+                screen_name = "demo"
+                profile_image_url = ""
+                verified = True
+
+            class NativeMetrics:
+                likes = 0
+                retweets = 0
+                replies = 0
+                quotes = 0
+                views = 0
+                bookmarks = 0
+
+            class NativeTweet:
+                id = "111"
+                text = "hello"
+                author = NativeAuthor()
+                metrics = NativeMetrics()
+                created_at = "2026-04-29T00:00:00+00:00"
+                media = []
+                urls = []
+                is_retweet = False
+                lang = "en"
+                retweeted_by = None
+                quoted_tweet = None
+                score = None
+                article_title = None
+                article_text = None
+                is_subscriber_only = False
+                is_promoted = False
+
+            return type("NativeClient", (), {"fetch_tweet_detail": lambda self_, tweet_id, count=1: [NativeTweet()]})()
 
         def _fetch_tweet_detail_payload(self, tweet_id: str):
             assert tweet_id == "111"
@@ -774,6 +846,121 @@ def test_scheduler_registers_feed_engage_job(monkeypatch, tmp_path: Path) -> Non
         job_ids = app.state.scheduler.list_job_ids()
         assert "scheduled-feed-engage" in job_ids
         assert app.state.scheduled_feed_engage.trigger_args["jitter"] == 137
+
+
+def test_scheduler_registers_author_alpha_job(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "scheduler.sqlite3"))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTOSTART", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__TRIGGER", "interval")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__SECONDS", "180")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__JITTER_SECONDS", "23")
+
+    with TestClient(app):
+        job_ids = app.state.scheduler.list_job_ids()
+        assert "scheduled-author-alpha-engage" in job_ids
+        assert app.state.scheduled_author_alpha_engage.trigger_args["jitter"] == 23
+
+
+def test_scheduler_dispatch_creates_author_alpha_execution_run(monkeypatch, tmp_path: Path) -> None:
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    class FakeReplyClient:
+        def reply(self, tweet_id: str, text: str):
+            return TwitterCommandResult(
+                action="reply",
+                ok=True,
+                target_tweet_id=tweet_id,
+                tweet_id="alpha-reply-1",
+                text=text,
+            )
+
+    class FakeNotificationsClient:
+        def fetch_device_follow_feed(self, *, count: int):
+            return {
+                "timeline_id": "tweet_notifications",
+                "top_cursor": "top-x",
+                "bottom_cursor": "bottom-x",
+                "posts": [
+                    {
+                        "id": "tweet-1",
+                        "text": "hello world",
+                        "created_at": "2026-04-27T00:00:00Z",
+                        "url": "https://x.com/alpha_one/status/tweet-1",
+                        "author": {
+                            "screen_name": "alpha_one",
+                            "name": "Alpha One",
+                            "rest_id": "rest-alpha-one",
+                            "verified": True,
+                        },
+                        "public_metrics": {"likes": 0, "replies": 0, "reposts": 0, "quotes": 0},
+                        "reply_to_id": None,
+                    }
+                ],
+            }
+
+    class FakeDrafter:
+        def draft_reply(self, candidate, context=None):
+            return "author alpha draft"
+
+    db_path = tmp_path / "scheduler.sqlite3"
+    alpha_db_path = tmp_path / "author-alpha.sqlite3"
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(alpha_db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTOSTART", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__TRIGGER", "interval")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__SECONDS", "180")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__INTER_REPLY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__TARGET_SWITCH_DELAY_SECONDS", "0")
+    monkeypatch.setenv("X_ATUO_AI__PROVIDER", "mock")
+    monkeypatch.setattr(automation_api.TwitterClient, "from_config", lambda *args, **kwargs: FakeReplyClient())
+    monkeypatch.setattr(automation_api.XWebNotificationsClient, "from_settings", lambda *args, **kwargs: FakeNotificationsClient())
+    monkeypatch.setattr(automation_api, "build_ai_provider", lambda settings: FakeDrafter())
+
+    alpha_storage = AuthorAlphaStorage(alpha_db_path)
+    alpha_storage.initialize()
+    alpha_storage.upsert_author(
+        screen_name="alpha_one",
+        author_name="Alpha One",
+        rest_id="rest-alpha-one",
+        author_score=100.0,
+        reply_count_7d=1,
+        impressions_total_7d=100,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=100,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T00:00:00+00:00",
+        last_scored_at="2026-04-27T00:00:00+00:00",
+        source="test",
+    )
+
+    with TestClient(app):
+        definition = app.state.scheduled_author_alpha_engage
+        app.state.scheduler._dispatch_job(definition.request)
+
+        deadline = time.monotonic() + 1.0
+        row = None
+        while time.monotonic() < deadline:
+            with alpha_storage.connect() as connection:
+                row = connection.execute(
+                    "SELECT id, job_type, endpoint, status FROM alpha_runs ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            if row is not None and row[1:] == ("author_alpha_engage", "scheduler:author-alpha-engage", "completed"):
+                break
+            time.sleep(0.01)
+
+    assert row is not None
+    assert row[1:] == ("author_alpha_engage", "scheduler:author-alpha-engage", "completed")
+
+    run_payload = alpha_storage.get_execution_run(str(row[0]))
+    assert run_payload is not None
+    assert run_payload["run"]["job_type"] == "author_alpha_engage"
+    assert run_payload["run"]["status"] == "completed"
+    assert run_payload["run"]["endpoint"] == "scheduler:author-alpha-engage"
+    assert alpha_storage.get_target_success_count("tweet-1") == 2
 
 
 def test_scheduler_dispatch_queue_processes_jobs_serially() -> None:
@@ -1197,9 +1384,497 @@ def test_explicit_engage_workflow_removed_from_state_model() -> None:
 
 
 def test_scheduler_first_service_keeps_only_feed_engage_workflow_surface() -> None:
-    assert set(WorkflowKind.__members__) == {"FEED_ENGAGE"}
+    assert "FEED_ENGAGE" in WorkflowKind.__members__
     assert not hasattr(AutomationRequest, "for_repo_post")
     assert not hasattr(AutomationRequest, "for_direct_post")
+
+
+def test_author_alpha_sync_status_route_returns_latest_state(monkeypatch) -> None:
+    class FakeManager:
+        def get_status(self) -> dict[str, object]:
+            return {
+                "active": False,
+                "bootstrap_required": True,
+                "active_run": None,
+                "latest_run": {
+                    "run_id": "bootstrap-1",
+                    "run_type": "bootstrap",
+                    "status": "completed",
+                    "from_date": "2026-04-01",
+                    "to_date": "2026-04-07",
+                    "current_date": "2026-04-07",
+                    "days_completed": 7,
+                    "days_total": 7,
+                    "resume_from_date": None,
+                    "error": None,
+                    "created_at": "2026-04-07T00:00:00+00:00",
+                    "started_at": "2026-04-07T00:00:00+00:00",
+                    "finished_at": "2026-04-07T00:10:00+00:00",
+                },
+                "bootstrap_checkpoint": {
+                    "sync_scope": "bootstrap",
+                    "last_completed_date": "2026-04-07",
+                    "next_pending_date": None,
+                    "last_run_id": "bootstrap-1",
+                    "updated_at": "2026-04-07T00:10:00+00:00",
+                },
+                "reconcile_checkpoint": None,
+            }
+
+        def list_history(self, *, limit: int = 20):
+            raise AssertionError("history route should not be called")
+
+        def get_run(self, run_id: str):
+            raise AssertionError(f"run lookup should not be called for {run_id}")
+
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: FakeManager())
+
+    with TestClient(app) as client:
+        response = client.get("/author-alpha/sync/status")
+
+    assert response.status_code == 200
+    assert response.json()["bootstrap_required"] is True
+    assert response.json()["latest_run"]["run_id"] == "bootstrap-1"
+
+
+def test_author_alpha_bootstrap_route_starts_background_run(monkeypatch) -> None:
+    started: dict[str, object] = {}
+
+    class FakeManager:
+        def start_bootstrap(self, **kwargs) -> dict[str, object]:
+            started.update(kwargs)
+            return {
+                "run_id": "bootstrap-queued",
+                "run_type": "bootstrap",
+                "status": "accepted",
+                "from_date": kwargs["from_date"],
+                "to_date": kwargs["to_date"],
+                "resume": kwargs.get("resume", False),
+                "max_days": kwargs.get("max_days"),
+            }
+
+        def get_status(self) -> dict[str, object]:
+            raise AssertionError("status route should not be called")
+
+        def list_history(self, *, limit: int = 20):
+            raise AssertionError("history route should not be called")
+
+        def get_run(self, run_id: str):
+            raise AssertionError(f"run lookup should not be called for {run_id}")
+
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: FakeManager())
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/author-alpha/sync/bootstrap",
+            json={"from_date": "2026-04-01", "to_date": "2026-04-07", "resume": True, "max_days": 2},
+        )
+
+    assert response.status_code == 202
+    assert started == {
+        "from_date": "2026-04-01",
+        "to_date": "2026-04-07",
+        "resume": True,
+        "max_days": 2,
+    }
+    assert response.json()["run_id"] == "bootstrap-queued"
+
+
+def test_author_alpha_sync_routes_reject_second_active_sync(monkeypatch) -> None:
+    class FakeManager:
+        def start_bootstrap(self, **kwargs) -> dict[str, object]:
+            return {
+                "run_id": "bootstrap-queued",
+                "run_type": "bootstrap",
+                "status": "accepted",
+                "from_date": kwargs["from_date"],
+                "to_date": kwargs["to_date"],
+                "resume": kwargs.get("resume", False),
+                "max_days": kwargs.get("max_days"),
+            }
+
+        def start_reconcile(self, **kwargs) -> dict[str, object]:
+            raise automation_api.AuthorAlphaSyncActiveError("author-alpha sync run already active")
+
+        def get_status(self) -> dict[str, object]:
+            raise AssertionError("status route should not be called")
+
+        def list_history(self, *, limit: int = 20):
+            raise AssertionError("history route should not be called")
+
+        def get_run(self, run_id: str):
+            raise AssertionError(f"run lookup should not be called for {run_id}")
+
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: FakeManager())
+
+    with TestClient(app) as client:
+        first = client.post("/author-alpha/sync/bootstrap", json={"from_date": "2026-04-01", "to_date": "2026-04-07"})
+        second = client.post("/author-alpha/sync/reconcile", json={})
+
+    assert first.status_code == 202
+    assert second.status_code == 409
+
+
+def test_author_alpha_sync_stop_route_requests_cancellation(monkeypatch) -> None:
+    class FakeManager:
+        def stop_active_run(self) -> dict[str, object]:
+            return {
+                "run_id": "bootstrap-queued",
+                "run_type": "bootstrap",
+                "status": "stop_requested",
+            }
+
+        def get_status(self) -> dict[str, object]:
+            raise AssertionError("status route should not be called")
+
+        def start_bootstrap(self, **kwargs) -> dict[str, object]:
+            raise AssertionError(f"bootstrap route should not be called: {kwargs}")
+
+        def start_reconcile(self, **kwargs) -> dict[str, object]:
+            raise AssertionError(f"reconcile route should not be called: {kwargs}")
+
+        def list_history(self, *, limit: int = 20):
+            raise AssertionError("history route should not be called")
+
+        def get_run(self, run_id: str):
+            raise AssertionError(f"run lookup should not be called for {run_id}")
+
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: FakeManager())
+
+    with TestClient(app) as client:
+        response = client.post("/author-alpha/sync/stop")
+
+    assert response.status_code == 202
+    assert response.json()["status"] == "stop_requested"
+
+
+def test_author_alpha_sync_history_and_run_lookup_routes(monkeypatch) -> None:
+    run_payload = {
+        "run_id": "reconcile-1",
+        "run_type": "reconcile",
+        "status": "completed",
+        "from_date": "2026-04-26",
+        "to_date": "2026-04-26",
+        "current_date": "2026-04-26",
+        "days_completed": 1,
+        "days_total": 1,
+        "resume_from_date": None,
+        "error": None,
+        "created_at": "2026-04-27T00:00:00+00:00",
+        "started_at": "2026-04-27T00:00:00+00:00",
+        "finished_at": "2026-04-27T00:01:00+00:00",
+    }
+
+    class FakeManager:
+        def get_status(self) -> dict[str, object]:
+            raise AssertionError("status route should not be called")
+
+        def start_bootstrap(self, **kwargs) -> dict[str, object]:
+            raise AssertionError(f"bootstrap route should not be called: {kwargs}")
+
+        def start_reconcile(self, **kwargs) -> dict[str, object]:
+            raise AssertionError(f"reconcile route should not be called: {kwargs}")
+
+        def list_history(self, *, limit: int = 20):
+            assert limit == 5
+            return [run_payload]
+
+        def get_run(self, run_id: str):
+            return run_payload if run_id == "reconcile-1" else None
+
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: FakeManager())
+
+    with TestClient(app) as client:
+        history = client.get("/author-alpha/sync/history", params={"limit": 5})
+        found = client.get("/author-alpha/runs/reconcile-1")
+        missing = client.get("/author-alpha/runs/does-not-exist")
+
+    assert history.status_code == 200
+    assert history.json()["runs"][0]["run_id"] == "reconcile-1"
+    assert found.status_code == 200
+    assert found.json()["run"]["run_id"] == "reconcile-1"
+    assert missing.status_code == 404
+
+
+def test_author_alpha_reset_route_clears_data(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    storage = AuthorAlphaStorage(db_path)
+    storage.initialize()
+    storage.upsert_author(
+        screen_name="alpha_one",
+        author_name="Alpha One",
+        rest_id="rest-alpha-one",
+        author_score=100.0,
+        reply_count_7d=1,
+        impressions_total_7d=100,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=100,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T00:00:00+00:00",
+        last_scored_at="2026-04-27T00:00:00+00:00",
+        source="test",
+    )
+    storage.record_sync_run(
+        run_id="bootstrap-1",
+        run_type="bootstrap",
+        status="failed",
+        from_date="2026-04-21",
+        to_date="2026-04-27",
+        current_date="2026-04-21",
+        days_completed=0,
+        days_total=7,
+        resume_from_date="2026-04-21",
+        error="boom",
+    )
+    storage.record_engagement(
+        run_id="alpha-run-1",
+        target_author="alpha_one",
+        target_tweet_id="tweet-1",
+        target_tweet_url=None,
+        reply_tweet_id="reply-1",
+        reply_url=None,
+        created_at="2026-04-27T00:00:00+00:00",
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/author-alpha/reset")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cleared"
+    assert storage.count_authors() == 0
+    assert storage.count_reply_daily_metrics() == 0
+    assert storage.count_author_daily_rollups() == 0
+    assert storage.get_active_sync_run() is None
+    assert storage.list_sync_runs(limit=10) == []
+
+
+def test_author_alpha_run_lookup_returns_execution_run(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    storage = AuthorAlphaStorage(db_path)
+    storage.initialize()
+    storage.create_execution_run(
+        run_id="alpha-run-1",
+        job_id="scheduled-author-alpha-engage",
+        job_type="author_alpha_engage",
+        endpoint="scheduler:author-alpha-engage",
+        request_payload={"dry_run": False},
+        status="running",
+    )
+    storage.add_execution_audit_event(
+        run_id="alpha-run-1",
+        event_type="trigger_received",
+        node="service",
+        payload={"endpoint": "scheduler:author-alpha-engage"},
+    )
+    storage.update_execution_run(
+        "alpha-run-1",
+        status="completed",
+        response_payload={"status": "completed"},
+        started_at="2026-04-27T00:00:00+00:00",
+        finished_at="2026-04-27T00:01:00+00:00",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/author-alpha/runs/alpha-run-1")
+
+    assert response.status_code == 200
+    assert response.json()["run"]["id"] == "alpha-run-1"
+    assert response.json()["audit_events"][0]["event_type"] == "trigger_received"
+
+
+def test_author_alpha_manual_execute_route_runs_once_without_scheduler(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__INTER_REPLY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__TARGET_SWITCH_DELAY_SECONDS", "0")
+    monkeypatch.setenv("X_ATUO_AI__PROVIDER", "mock")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    class FakeReplyClient:
+        def reply(self, tweet_id: str, text: str):
+            return TwitterCommandResult(
+                action="reply",
+                ok=True,
+                target_tweet_id=tweet_id,
+                tweet_id="alpha-reply-1",
+                text=text,
+            )
+
+    class FakeNotificationsClient:
+        def fetch_device_follow_feed(self, *, count: int):
+            return {
+                "timeline_id": "tweet_notifications",
+                "top_cursor": "top-x",
+                "bottom_cursor": "bottom-x",
+                "posts": [
+                    {
+                        "id": "tweet-1",
+                        "text": "hello world",
+                        "created_at": "2026-04-27T00:00:00Z",
+                        "url": "https://x.com/alpha_one/status/tweet-1",
+                        "author": {
+                            "screen_name": "alpha_one",
+                            "name": "Alpha One",
+                            "rest_id": "rest-alpha-one",
+                            "verified": True,
+                        },
+                        "public_metrics": {"likes": 0, "replies": 0, "reposts": 0, "quotes": 0},
+                        "reply_to_id": None,
+                    }
+                ],
+            }
+
+    class FakeDrafter:
+        def draft_reply(self, candidate, context=None):
+            return "author alpha draft"
+
+    monkeypatch.setattr(automation_api.TwitterClient, "from_config", lambda *args, **kwargs: FakeReplyClient())
+    monkeypatch.setattr(automation_api.XWebNotificationsClient, "from_settings", lambda *args, **kwargs: FakeNotificationsClient())
+    monkeypatch.setattr(automation_api, "build_ai_provider", lambda settings: FakeDrafter())
+
+    storage = AuthorAlphaStorage(db_path)
+    storage.initialize()
+    storage.upsert_author(
+        screen_name="alpha_one",
+        author_name="Alpha One",
+        rest_id="rest-alpha-one",
+        author_score=100.0,
+        reply_count_7d=1,
+        impressions_total_7d=100,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=100,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T00:00:00+00:00",
+        last_scored_at="2026-04-27T00:00:00+00:00",
+        source="test",
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/author-alpha/execute", json={"dry_run": True})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_type"] == "author_alpha_engage"
+    assert payload["endpoint"] == "manual:author-alpha-engage"
+    assert payload["status"] in {"completed", "failed", "skipped"}
+
+
+def test_feed_engage_manual_execute_route_runs_once_without_scheduler(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "manual-feed.sqlite3"
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    storage = AutomationStorage(db_path)
+    storage.initialize()
+
+    async def fake_run_request(request_obj, *, storage, endpoint, proxy=None, observability_runtime=None):
+        assert request_obj.workflow is WorkflowKind.FEED_ENGAGE
+        assert request_obj.job_name == "manual-feed-engage"
+        assert request_obj.feed_options is not None
+        assert request_obj.feed_options.feed_count == 3
+        assert request_obj.feed_options.feed_type == "following"
+        assert request_obj.reply_text == "hello"
+        assert endpoint == "manual:feed-engage"
+        assert proxy == "http://127.0.0.1:7890"
+        return {"status": "completed", "run_id": request_obj.run_id, "result": {"ok": True}}
+
+    monkeypatch.setattr("x_atuo.automation.api._run_request", fake_run_request)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/feed-engage/execute",
+            json={"dry_run": True, "reply_text": "hello", "feed_count": 3, "feed_type": "following"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["job_type"] == "feed_engage"
+    assert payload["endpoint"] == "manual:feed-engage"
+    assert payload["status"] == "completed"
+
+
+def test_author_alpha_manual_execute_route_rejects_removed_override_fields(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/author-alpha/execute",
+            json={"dry_run": True, "reply_text": "manual", "max_targets_per_run": 1, "burst_limit": 1},
+        )
+
+    assert response.status_code == 422
+
+
+def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_path: Path) -> None:
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+    from x_atuo.automation.state import ExecutionResult, RunStatus, WorkflowStateModel
+
+    class FakeNotificationsClient:
+        pass
+
+    class FakeReplyClient:
+        pass
+
+    class FakeDrafter:
+        pass
+
+    captured: dict[str, object] = {}
+
+    async def fake_run_author_alpha_engage(
+        request,
+        *,
+        config,
+        storage,
+        candidate_source,
+        drafter,
+        reply_client,
+        sleep=None,
+        now=None,
+    ):
+        captured["sleep"] = sleep
+        return WorkflowStateModel(
+            run_id=request.run_id or "run-1",
+            request=request,
+            status=RunStatus.COMPLETED,
+            result=ExecutionResult(action="author_alpha_engage", ok=True, dry_run=True),
+        )
+
+    monkeypatch.setattr(automation_api.XWebNotificationsClient, "from_settings", lambda *args, **kwargs: FakeNotificationsClient())
+    monkeypatch.setattr(automation_api.TwitterClient, "from_config", lambda *args, **kwargs: FakeReplyClient())
+    monkeypatch.setattr(automation_api, "build_ai_provider", lambda settings: FakeDrafter())
+    monkeypatch.setattr(automation_api, "run_author_alpha_engage", fake_run_author_alpha_engage)
+
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    request = AutomationRequest.for_author_alpha_engage(job_name="manual-author-alpha-engage", dry_run=True)
+
+    result = asyncio.run(
+        automation_api._run_author_alpha_request(
+            request,
+            settings=AutomationConfig(),
+            storage=storage,
+            endpoint="manual:author-alpha-engage",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert captured["sleep"] is asyncio.sleep
 
 
 def test_openai_compatible_provider_parses_fenced_json() -> None:
@@ -1349,6 +2024,80 @@ def test_openai_compatible_provider_uses_compact_draft_reply_payload_with_media_
         "media_types": ["video", "photo"],
     }
     assert "metadata" not in payload["candidate"]
+
+
+def test_twitter_read_routes_use_core_client(monkeypatch) -> None:
+    class FakeClient:
+        def fetch_search(self, query: str, *, max_items: int = 20, product: str = "Top"):
+            assert query == "openai"
+            assert max_items == 2
+            assert product == "Latest"
+            return [FeedCandidate(tweet_id="tweet-search", screen_name="author_one", text="search result").model_dump()]
+
+        def fetch_bookmarks(self, *, max_items: int = 50):
+            assert max_items == 3
+            return [FeedCandidate(tweet_id="tweet-bookmark", screen_name="author_one", text="bookmark result").model_dump()]
+
+        def fetch_bookmark_folders(self):
+            return [{"id": "folder-1", "name": "Important"}]
+
+        def fetch_bookmark_folder_posts(self, folder_id: str, *, max_items: int = 50):
+            assert folder_id == "folder-1"
+            assert max_items == 4
+            return [FeedCandidate(tweet_id="tweet-folder", screen_name="author_one", text="folder result").model_dump()]
+
+        def fetch_user_likes(self, screen_name: str, *, max_items: int = 20):
+            assert screen_name == "author_one"
+            assert max_items == 5
+            return [FeedCandidate(tweet_id="tweet-like", screen_name="author_one", text="liked").model_dump()]
+
+        def fetch_followers(self, screen_name: str, *, max_items: int = 20):
+            assert screen_name == "author_one"
+            assert max_items == 6
+            return [{"screen_name": "follower_one", "verified": True}]
+
+        def fetch_following(self, screen_name: str, *, max_items: int = 20):
+            assert screen_name == "author_one"
+            assert max_items == 7
+            return [{"screen_name": "following_one", "verified": False}]
+
+        def fetch_article(self, tweet_id: str):
+            assert tweet_id == "tweet-article-1"
+            return FeedCandidate(
+                tweet_id="tweet-article-1",
+                screen_name="author_one",
+                text="article preview",
+                metadata={"article_title": "Longform Title", "article_text": "Longform body"},
+            ).model_dump()
+
+    monkeypatch.setattr(automation_api.TwitterClient, "from_config", lambda *args, **kwargs: FakeClient())
+
+    with TestClient(app) as client:
+        search = client.get("/twitter/search", params={"q": "openai", "limit": 2, "product": "Latest"})
+        bookmarks = client.get("/twitter/bookmarks", params={"limit": 3})
+        folders = client.get("/twitter/bookmarks/folders")
+        folder_posts = client.get("/twitter/bookmarks/folders/folder-1", params={"limit": 4})
+        likes = client.get("/twitter/users/author_one/likes", params={"limit": 5})
+        followers = client.get("/twitter/users/author_one/followers", params={"limit": 6})
+        following = client.get("/twitter/users/author_one/following", params={"limit": 7})
+        article = client.get("/twitter/articles/tweet-article-1")
+
+    assert search.status_code == 200
+    assert search.json()["items"][0]["tweet_id"] == "tweet-search"
+    assert bookmarks.status_code == 200
+    assert bookmarks.json()["items"][0]["tweet_id"] == "tweet-bookmark"
+    assert folders.status_code == 200
+    assert folders.json()["items"][0]["id"] == "folder-1"
+    assert folder_posts.status_code == 200
+    assert folder_posts.json()["items"][0]["tweet_id"] == "tweet-folder"
+    assert likes.status_code == 200
+    assert likes.json()["items"][0]["tweet_id"] == "tweet-like"
+    assert followers.status_code == 200
+    assert followers.json()["items"][0]["screen_name"] == "follower_one"
+    assert following.status_code == 200
+    assert following.json()["items"][0]["screen_name"] == "following_one"
+    assert article.status_code == 200
+    assert article.json()["tweet"]["tweet_id"] == "tweet-article-1"
 
 
 def test_runtime_draft_metrics_use_compact_prompt_payload(monkeypatch, tmp_path: Path) -> None:

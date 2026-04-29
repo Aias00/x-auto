@@ -1,10 +1,9 @@
-"""Low-level twitter-cli wrapper for automation service use."""
+"""Low-level Twitter/X client wrapper backed by in-repo native HTTP logic."""
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import urllib.parse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from collections.abc import Mapping, Sequence
@@ -12,9 +11,15 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from x_atuo.core.twitter_runtime import load_twitter_runtime
+from x_atuo.core.twitter_native_adapters import tweet_record_from_native, user_profile_payload_from_native
+from x_atuo.core.x_native_client import TwitterClient as NativeTwitterClient
+from x_atuo.core.x_graphql import TWEET_DETAIL_SPEC, build_graphql_get_url
 from x_atuo.core.twitter_models import PostResult, TweetRecord, TwitterCommandResult
+from x_atuo.core.x_native_exceptions import TwitterAPIError as NativeTwitterAPIError
+from x_atuo.core.x_native_exceptions import TwitterError as NativeTwitterError
+from x_atuo.core.x_native_models import Tweet as NativeTweet
+from x_atuo.core.x_native_models import UserProfile as NativeUserProfile
 
 
 class TwitterClientError(RuntimeError):
@@ -40,15 +45,6 @@ class TwitterCredentials:
 
 
 @dataclass(slots=True)
-class _CommandExecution:
-    command: tuple[str, ...]
-    returncode: int
-    payload: dict[str, Any]
-    stdout: str
-    stderr: str
-
-
-@dataclass(slots=True)
 class TwitterClient:
     twitter_bin: str = "twitter"
     credentials: TwitterCredentials = field(default_factory=TwitterCredentials)
@@ -56,6 +52,8 @@ class TwitterClient:
     timeout: int = 120
     base_env: dict[str, str] = field(default_factory=lambda: os.environ.copy())
     config: dict[str, Any] = field(default_factory=dict)
+    cookie_string: str | None = None
+    _native_client: NativeTwitterClient | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_config(
@@ -68,23 +66,18 @@ class TwitterClient:
         base_env: Mapping[str, str] | None = None,
     ) -> "TwitterClient":
         env = dict(base_env) if base_env is not None else os.environ.copy()
-        config_file = Path(config_path)
-        data: dict[str, Any] = {}
-        if config_file.exists():
-            loaded = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
-            if not isinstance(loaded, dict):
-                raise ValueError(f"Unexpected config shape in {config_file}")
-            data = loaded
+        runtime = load_twitter_runtime(config_path, proxy=proxy, base_env=env)
         return cls(
             twitter_bin=str(twitter_bin),
             credentials=TwitterCredentials(
-                auth_token=str(data.get("twitter_auth_token") or env.get("TWITTER_AUTH_TOKEN") or ""),
-                ct0=str(data.get("twitter_ct0") or env.get("TWITTER_CT0") or ""),
+                auth_token=runtime.auth_token,
+                ct0=runtime.ct0,
             ),
-            proxy=proxy or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY"),
+            proxy=runtime.proxy,
             timeout=timeout,
             base_env=env,
-            config=data,
+            config=dict(runtime.source_config or {}),
+            cookie_string=runtime.cookie_string,
         )
 
     def with_runtime(
@@ -114,6 +107,7 @@ class TwitterClient:
             timeout=self.timeout,
             base_env=merged_env,
             config=merged_config,
+            cookie_string=self.cookie_string,
         )
 
     def build_env(self) -> dict[str, str]:
@@ -128,25 +122,28 @@ class TwitterClient:
     def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None) -> list[TweetRecord]:
         if max_items < 1:
             raise ValueError("max_items must be >= 1")
-        args = ["feed", "-n", str(max_items)]
-        if feed_type:
-            args.extend(["-t", feed_type])
-        payload = self._run_json(args).payload
-        data = payload.get("data")
-        if not isinstance(data, list) or not data:
-            raise TwitterClientError("No feed data returned")
-        items = [TweetRecord.from_payload(item) for item in data if isinstance(item, dict)]
+        try:
+            native = self._build_native_client()
+            if feed_type == "following":
+                tweets = native.fetch_following_feed(count=max_items)
+            else:
+                tweets = native.fetch_home_timeline(count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch feed: {exc}") from exc
+        items = [self._tweet_record_from_native(tweet) for tweet in tweets]
         items = [item for item in items if item.tweet_id and item.screen_name]
         if not items:
             raise TwitterClientError("No valid feed items returned")
         return items
 
     def fetch_tweet(self, tweet_id: str) -> TweetRecord:
-        payload = self._run_json(["tweet", tweet_id]).payload
-        tweets = self._parse_tweets(payload)
+        try:
+            tweets = self._build_native_client().fetch_tweet_detail(tweet_id, count=1)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch tweet {tweet_id}: {exc}") from exc
         if not tweets:
             raise TwitterClientError(f"No tweet data returned for {tweet_id}")
-        tweet = tweets[0]
+        tweet = self._tweet_record_from_native(tweets[0])
         if not tweet.tweet_id:
             raise TwitterClientError(f"Invalid tweet payload returned for {tweet_id}")
         return self._enrich_tweet_reply_state(tweet)
@@ -154,45 +151,125 @@ class TwitterClient:
     def fetch_tweet_thread(self, tweet_id: str, *, max_replies: int = 5) -> tuple[TweetRecord, list[TweetRecord]]:
         if max_replies < 0:
             raise ValueError("max_replies must be >= 0")
-        payload = self._run_json(["tweet", tweet_id, "-n", str(max_replies)]).payload
-        tweets = self._parse_tweets(payload)
+        try:
+            tweets = self._build_native_client().fetch_tweet_detail(tweet_id, count=max_replies + 1)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch tweet thread {tweet_id}: {exc}") from exc
         if not tweets:
             raise TwitterClientError(f"No tweet thread returned for {tweet_id}")
-        return self._enrich_tweet_reply_state(tweets[0]), tweets[1:]
+        normalized = [self._tweet_record_from_native(tweet) for tweet in tweets]
+        return self._enrich_tweet_reply_state(normalized[0]), normalized[1:]
 
     def fetch_user_profile(self, screen_name: str) -> dict[str, object]:
-        payload = self._run_json(["user", screen_name]).payload
-        data = payload.get("data")
-        if isinstance(data, list):
-            record = next((item for item in data if isinstance(item, dict)), None)
-        elif isinstance(data, dict):
-            record = data
-        else:
-            record = None
-        if record is None:
-            raise TwitterClientError(f"No user profile returned for {screen_name}")
-        raw = dict(record)
+        try:
+            profile = self._build_native_client().fetch_user(screen_name)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch user profile @{screen_name}: {exc}") from exc
+        raw = self._user_profile_to_raw(profile)
         return {
-            "screen_name": str(raw.get("screenName") or raw.get("screen_name") or screen_name),
-            "name": str(raw.get("name")) if raw.get("name") else None,
-            "verified": bool(raw.get("verified")),
-            "description": str(raw.get("description") or raw.get("bio") or "") or None,
-            "followers_count": raw.get("followersCount") or raw.get("followers_count"),
-            "following_count": raw.get("followingCount") or raw.get("following_count"),
+            "screen_name": str(profile.screen_name or screen_name),
+            "name": str(profile.name) if profile.name else None,
+            "verified": bool(profile.verified),
+            "description": str(profile.bio or "") or None,
+            "followers_count": profile.followers_count,
+            "following_count": profile.following_count,
             "raw": raw,
         }
 
     def fetch_user_posts(self, screen_name: str, *, max_items: int = 5) -> list[TweetRecord]:
         if max_items < 1:
             raise ValueError("max_items must be >= 1")
-        payload = self._run_json(["user-posts", screen_name, "-n", str(max_items), "--full-text"]).payload
-        tweets = self._parse_tweets(payload)
+        try:
+            native = self._build_native_client()
+            user_id = native.resolve_user_id(screen_name)
+            tweets = native.fetch_user_tweets(user_id, count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch user posts @{screen_name}: {exc}") from exc
+        tweets = [self._tweet_record_from_native(tweet) for tweet in tweets]
         if not tweets:
             raise TwitterClientError(f"No user posts returned for {screen_name}")
         return tweets
 
+    def fetch_search(self, query: str, *, max_items: int = 20, product: str = "Top") -> list[TweetRecord]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            tweets = self._build_native_client().fetch_search(query, count=max_items, product=product)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to search tweets for {query!r}: {exc}") from exc
+        items = [self._tweet_record_from_native(tweet) for tweet in tweets]
+        return [item for item in items if item.tweet_id and item.screen_name]
+
+    def fetch_bookmarks(self, *, max_items: int = 50) -> list[TweetRecord]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            tweets = self._build_native_client().fetch_bookmarks(count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch bookmarks: {exc}") from exc
+        items = [self._tweet_record_from_native(tweet) for tweet in tweets]
+        return [item for item in items if item.tweet_id and item.screen_name]
+
+    def fetch_bookmark_folders(self) -> list[dict[str, object]]:
+        try:
+            folders = self._build_native_client().fetch_bookmark_folders()
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch bookmark folders: {exc}") from exc
+        return [{"id": folder.id, "name": folder.name} for folder in folders]
+
+    def fetch_bookmark_folder_posts(self, folder_id: str, *, max_items: int = 50) -> list[TweetRecord]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            tweets = self._build_native_client().fetch_bookmark_folder_timeline(folder_id, count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch bookmark folder {folder_id}: {exc}") from exc
+        items = [self._tweet_record_from_native(tweet) for tweet in tweets]
+        return [item for item in items if item.tweet_id and item.screen_name]
+
+    def fetch_user_likes(self, screen_name: str, *, max_items: int = 20) -> list[TweetRecord]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            native = self._build_native_client()
+            user_id = native.resolve_user_id(screen_name)
+            tweets = native.fetch_user_likes(user_id, count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch user likes @{screen_name}: {exc}") from exc
+        items = [self._tweet_record_from_native(tweet) for tweet in tweets]
+        return [item for item in items if item.tweet_id and item.screen_name]
+
+    def fetch_followers(self, screen_name: str, *, max_items: int = 20) -> list[dict[str, object]]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            native = self._build_native_client()
+            user_id = native.resolve_user_id(screen_name)
+            profiles = native.fetch_followers(user_id, count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch followers @{screen_name}: {exc}") from exc
+        return [self._user_profile_to_raw(profile) for profile in profiles]
+
+    def fetch_following(self, screen_name: str, *, max_items: int = 20) -> list[dict[str, object]]:
+        if max_items < 1:
+            raise ValueError("max_items must be >= 1")
+        try:
+            native = self._build_native_client()
+            user_id = native.resolve_user_id(screen_name)
+            profiles = native.fetch_following(user_id, count=max_items)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch following @{screen_name}: {exc}") from exc
+        return [self._user_profile_to_raw(profile) for profile in profiles]
+
+    def fetch_article(self, tweet_id: str) -> TweetRecord:
+        try:
+            tweet = self._build_native_client().fetch_article(tweet_id)
+        except Exception as exc:
+            raise TwitterClientError(f"Failed to fetch article {tweet_id}: {exc}") from exc
+        return self._tweet_record_from_native(tweet)
+
     def _enrich_tweet_reply_state(self, tweet: TweetRecord) -> TweetRecord:
-        if not tweet.tweet_id or tweet.can_reply is not None or not self.credentials.ok:
+        if not tweet.tweet_id or not self.credentials.ok:
             return tweet
         try:
             detail_payload = self._fetch_tweet_detail_payload(tweet.tweet_id)
@@ -200,9 +277,24 @@ class TwitterClient:
             return tweet
         reply_state = _extract_reply_state_from_detail_payload(detail_payload, tweet.tweet_id)
         reply_policy = _extract_reply_control_policy_from_detail_payload(detail_payload, tweet.tweet_id)
-        if reply_state is None and reply_policy is None:
+        reply_ancestry = _extract_reply_ancestry_from_detail_payload(detail_payload, tweet.tweet_id)
+        reply_target = _extract_reply_target_from_detail_payload(detail_payload, tweet.tweet_id)
+        if reply_state is None and reply_policy is None and reply_ancestry is None and reply_target is None:
             return tweet
-        can_reply, reply_limit_headline, reply_limit_reason = reply_state or (tweet.can_reply, tweet.reply_limit_headline, tweet.reply_limit_reason)
+        can_reply, reply_limit_headline, reply_limit_reason = reply_state or (
+            tweet.can_reply,
+            tweet.reply_limit_headline,
+            tweet.reply_limit_reason,
+        )
+        conversation_id, reply_to_tweet_id, reply_to_screen_name = reply_ancestry or (
+            tweet.conversation_id,
+            tweet.reply_to_tweet_id,
+            tweet.reply_to_screen_name,
+        )
+        target_tweet_id, target_screen_name = reply_target or (
+            tweet.target_tweet_id,
+            tweet.target_screen_name,
+        )
         raw = dict(tweet.raw) if isinstance(tweet.raw, dict) else {}
         if can_reply is not None:
             raw["canReply"] = can_reply
@@ -212,8 +304,23 @@ class TwitterClient:
             raw["replyLimitReason"] = reply_limit_reason
         if reply_policy is not None:
             raw["replyRestrictionPolicy"] = reply_policy
+        if conversation_id is not None:
+            raw["conversationId"] = conversation_id
+        if reply_to_tweet_id is not None:
+            raw["replyToTweetId"] = reply_to_tweet_id
+        if reply_to_screen_name is not None:
+            raw["replyToScreenName"] = reply_to_screen_name
+        if target_tweet_id is not None:
+            raw["targetTweetId"] = target_tweet_id
+        if target_screen_name is not None:
+            raw["targetScreenName"] = target_screen_name
         return replace(
             tweet,
+            conversation_id=conversation_id,
+            reply_to_tweet_id=reply_to_tweet_id,
+            reply_to_screen_name=reply_to_screen_name,
+            target_tweet_id=target_tweet_id,
+            target_screen_name=target_screen_name,
             can_reply=can_reply,
             reply_limit_headline=reply_limit_headline,
             reply_limit_reason=reply_limit_reason,
@@ -237,31 +344,179 @@ class TwitterClient:
         return payload
 
     def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
-        execution = self._run_json(["reply", tweet_id, text], allow_error_payload=True)
-        payload = execution.payload
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        try:
+            created_tweet_id = self._build_native_client().create_tweet(text, reply_to_id=tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="reply",
+                ok=False,
+                target_tweet_id=tweet_id,
+                text=text,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
         return TwitterCommandResult(
             action="reply",
-            ok=bool(data.get("success")),
+            ok=bool(created_tweet_id),
             target_tweet_id=tweet_id,
-            tweet_id=self._extract_tweet_id(data),
+            tweet_id=created_tweet_id or None,
             text=text,
-            payload=payload,
-            error_code=self._extract_error_code(payload),
-            error_message=self._extract_error_message(payload),
+            payload={"data": {"success": bool(created_tweet_id), "rest_id": created_tweet_id}},
         )
 
     def follow(self, screen_name: str) -> TwitterCommandResult:
-        execution = self._run_json(["follow", screen_name], allow_error_payload=True)
-        payload = execution.payload
-        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        try:
+            native = self._build_native_client()
+            user_id = native.resolve_user_id(screen_name)
+            ok = native.follow_user(user_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="follow",
+                ok=False,
+                screen_name=screen_name,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
         return TwitterCommandResult(
             action="follow",
-            ok=bool(data.get("success", execution.returncode == 0)),
+            ok=bool(ok),
             screen_name=screen_name,
-            payload=payload,
-            error_code=self._extract_error_code(payload),
-            error_message=self._extract_error_message(payload),
+            payload={"data": {"success": bool(ok), "user_id": user_id}},
+        )
+
+    def like(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().like_tweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="like",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="like",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def unlike(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().unlike_tweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="unlike",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="unlike",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def bookmark(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().bookmark_tweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="bookmark",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="bookmark",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def unbookmark(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().unbookmark_tweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="unbookmark",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="unbookmark",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def delete_tweet(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().delete_tweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="delete",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="delete",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def retweet(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().retweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="retweet",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="retweet",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
+        )
+
+    def unretweet(self, tweet_id: str) -> TwitterCommandResult:
+        try:
+            ok = self._build_native_client().unretweet(tweet_id)
+        except Exception as exc:
+            return TwitterCommandResult(
+                action="unretweet",
+                ok=False,
+                target_tweet_id=tweet_id,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
+        return TwitterCommandResult(
+            action="unretweet",
+            ok=bool(ok),
+            target_tweet_id=tweet_id,
+            payload={"data": {"success": bool(ok), "tweet_id": tweet_id}},
         )
 
     def post(
@@ -271,24 +526,30 @@ class TwitterClient:
         reply_to: str | None = None,
         images: Sequence[str] | None = None,
     ) -> PostResult:
-        args = ["post", text]
         media = tuple(str(image) for image in (images or ()))
-        if reply_to:
-            args.extend(["-r", reply_to])
-        for image in media:
-            args.extend(["-i", image])
-        execution = self._run_json(args, allow_error_payload=True)
-        payload = execution.payload
+        try:
+            native = self._build_native_client()
+            media_ids = [native.upload_media(path) for path in media] if media else None
+            created_tweet_id = native.create_tweet(text, reply_to_id=reply_to, media_ids=media_ids)
+        except Exception as exc:
+            return PostResult(
+                ok=False,
+                action="post",
+                text=text,
+                target_tweet_id=reply_to,
+                media_paths=media,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
         return PostResult(
-            ok=execution.returncode == 0 and not self._extract_error_message(payload),
+            ok=bool(created_tweet_id),
             action="post",
             text=text,
-            tweet_id=self._extract_tweet_id(payload.get("data")),
+            tweet_id=created_tweet_id or None,
             target_tweet_id=reply_to,
             media_paths=media,
-            payload=payload,
-            error_code=self._extract_error_code(payload),
-            error_message=self._extract_error_message(payload),
+            payload={"data": {"success": bool(created_tweet_id), "rest_id": created_tweet_id}},
         )
 
     def quote(
@@ -298,68 +559,55 @@ class TwitterClient:
         *,
         images: Sequence[str] | None = None,
     ) -> PostResult:
-        args = ["quote", tweet_id, text]
         media = tuple(str(image) for image in (images or ()))
-        for image in media:
-            args.extend(["-i", image])
-        execution = self._run_json(args, allow_error_payload=True)
-        payload = execution.payload
+        try:
+            native = self._build_native_client()
+            media_ids = [native.upload_media(path) for path in media] if media else None
+            created_tweet_id = native.quote_tweet(tweet_id, text, media_ids=media_ids)
+        except Exception as exc:
+            return PostResult(
+                ok=False,
+                action="quote",
+                text=text,
+                target_tweet_id=tweet_id,
+                media_paths=media,
+                payload={},
+                error_code=_native_error_code(exc),
+                error_message=str(exc),
+            )
         return PostResult(
-            ok=execution.returncode == 0 and not self._extract_error_message(payload),
+            ok=bool(created_tweet_id),
             action="quote",
             text=text,
-            tweet_id=self._extract_tweet_id(payload.get("data")),
+            tweet_id=created_tweet_id or None,
             target_tweet_id=tweet_id,
             media_paths=media,
-            payload=payload,
-            error_code=self._extract_error_code(payload),
-            error_message=self._extract_error_message(payload),
+            payload={"data": {"success": bool(created_tweet_id), "rest_id": created_tweet_id}},
         )
 
-    def _parse_tweets(self, payload: dict[str, object]) -> list[TweetRecord]:
-        data = payload.get("data")
-        if not isinstance(data, list):
-            return []
-        tweets = [TweetRecord.from_payload(item) for item in data if isinstance(item, dict)]
-        return [tweet for tweet in tweets if tweet.tweet_id]
-
-    def _run_json(
-        self,
-        args: Sequence[str],
-        *,
-        allow_error_payload: bool = False,
-    ) -> _CommandExecution:
-        cmd = [self.twitter_bin, *args, "--json"]
-        try:
-            result = subprocess.run(
-                cmd,
-                env=self.build_env(),
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                check=False,
+    def _build_native_client(self) -> NativeTwitterClient:
+        if self._native_client is None:
+            if self.proxy:
+                os.environ["TWITTER_PROXY"] = self.proxy
+            elif "TWITTER_PROXY" in os.environ:
+                os.environ.pop("TWITTER_PROXY", None)
+            self._native_client = NativeTwitterClient(
+                self.credentials.auth_token,
+                self.credentials.ct0,
+                rate_limit_config={
+                    "requestDelay": 0.0,
+                    "maxRetries": 0,
+                    "maxCount": 500,
+                },
+                cookie_string=self.cookie_string,
             )
-        except OSError as exc:
-            raise TwitterClientError(f"Failed to execute {' '.join(cmd)}: {exc}") from exc
-        except subprocess.TimeoutExpired as exc:
-            raise TwitterClientError(f"twitter-cli timed out: {' '.join(cmd)}") from exc
+        return self._native_client
 
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise TwitterClientError(_format_cli_error(cmd, result.stdout, result.stderr)) from exc
-        if not isinstance(payload, dict):
-            raise TwitterClientError(f"Unexpected twitter-cli payload type: {type(payload)!r}")
-        execution = _CommandExecution(
-            command=tuple(cmd),
-            returncode=result.returncode,
-            payload=payload,
-            stdout=result.stdout,
-            stderr=result.stderr,
-        )
-        if execution.returncode != 0 and not allow_error_payload:
-            raise TwitterClientError(_format_cli_error(cmd, result.stdout, result.stderr))
-        return execution
+    def _tweet_record_from_native(self, tweet: NativeTweet) -> TweetRecord:
+        return tweet_record_from_native(tweet)
+
+    def _user_profile_to_raw(self, profile: NativeUserProfile) -> dict[str, Any]:
+        return user_profile_payload_from_native(profile)
 
     @staticmethod
     def _extract_error_code(payload: dict[str, Any]) -> str | None:
@@ -409,37 +657,6 @@ _TWITTER_BEARER_TOKEN = (
     "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
     "%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 )
-_TWEET_DETAIL_QUERY_ID = "xIYgDwjboktoFeXe_fgacw"
-_TWEET_DETAIL_FEATURES = {
-    "responsive_web_graphql_exclude_directive_enabled": True,
-    "verified_phone_label_enabled": False,
-    "creator_subscriptions_tweet_preview_api_enabled": True,
-    "responsive_web_graphql_timeline_navigation_enabled": True,
-    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-    "c9s_tweet_anatomy_moderator_badge_enabled": True,
-    "tweetypie_unmention_optimization_enabled": True,
-    "responsive_web_edit_tweet_api_enabled": True,
-    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
-    "view_counts_everywhere_api_enabled": True,
-    "longform_notetweets_consumption_enabled": True,
-    "responsive_web_twitter_article_tweet_consumption_enabled": True,
-    "tweet_awards_web_tipping_enabled": False,
-    "longform_notetweets_rich_text_read_enabled": True,
-    "longform_notetweets_inline_media_enabled": True,
-    "rweb_video_timestamps_enabled": True,
-    "responsive_web_media_download_video_enabled": True,
-    "freedom_of_speech_not_reach_fetch_enabled": True,
-    "standardized_nudges_misinfo": True,
-    "responsive_web_enhance_cards_enabled": False,
-}
-_TWEET_DETAIL_FIELD_TOGGLES = {
-    "withArticleRichContentState": True,
-    "withArticlePlainText": False,
-    "withGrokAnalyze": False,
-    "withDisallowedReplyControls": False,
-}
-
-
 def _build_tweet_detail_url(tweet_id: str) -> str:
     variables = {
         "focalTweetId": tweet_id,
@@ -452,13 +669,7 @@ def _build_tweet_detail_url(tweet_id: str) -> str:
         "withBirdwatchNotes": True,
         "withVoice": True,
     }
-    compact_features = {key: value for key, value in _TWEET_DETAIL_FEATURES.items() if value is not False}
-    return (
-        f"https://x.com/i/api/graphql/{_TWEET_DETAIL_QUERY_ID}/TweetDetail"
-        f"?variables={urllib.parse.quote(json.dumps(variables, separators=(",", ":")))}"
-        f"&features={urllib.parse.quote(json.dumps(compact_features, separators=(",", ":")))}"
-        f"&fieldToggles={urllib.parse.quote(json.dumps(_TWEET_DETAIL_FIELD_TOGGLES, separators=(",", ":")))}"
-    )
+    return build_graphql_get_url(TWEET_DETAIL_SPEC, variables=variables)
 
 
 def _build_twitter_headers(credentials: TwitterCredentials) -> dict[str, str]:
@@ -500,6 +711,67 @@ def _extract_reply_control_policy_from_detail_payload(payload: dict[str, Any], t
             continue
         return _extract_reply_control_policy(item)
     return None
+
+
+def _extract_reply_ancestry_from_detail_payload(
+    payload: dict[str, Any],
+    tweet_id: str,
+) -> tuple[str | None, str | None, str | None] | None:
+    tweet_id = str(tweet_id)
+    matched_result: dict[str, Any] | None = None
+    for item in _walk_mappings(payload):
+        if not _matches_tweet_id(item, tweet_id):
+            continue
+        matched_result = item
+        break
+    if matched_result is None:
+        return None
+
+    conversation_id = _coerce_non_empty_str(
+        _deep_get(matched_result, "legacy", "conversation_id_str")
+        or _deep_get(matched_result, "tweet", "legacy", "conversation_id_str")
+        or matched_result.get("conversation_id")
+        or matched_result.get("conversationId")
+    )
+    reply_to_tweet_id = _coerce_non_empty_str(
+        _deep_get(matched_result, "legacy", "in_reply_to_status_id_str")
+        or _deep_get(matched_result, "tweet", "legacy", "in_reply_to_status_id_str")
+        or matched_result.get("in_reply_to_status_id_str")
+        or matched_result.get("replyToTweetId")
+        or matched_result.get("reply_to_tweet_id")
+    )
+    reply_to_screen_name = _coerce_non_empty_str(
+        _deep_get(matched_result, "legacy", "in_reply_to_screen_name")
+        or _deep_get(matched_result, "tweet", "legacy", "in_reply_to_screen_name")
+        or matched_result.get("in_reply_to_screen_name")
+        or matched_result.get("replyToScreenName")
+        or matched_result.get("reply_to_screen_name")
+    )
+    if reply_to_screen_name is None and reply_to_tweet_id is not None:
+        reply_to_screen_name = _extract_tweet_author_screen_name(payload, reply_to_tweet_id)
+    if conversation_id is None and reply_to_tweet_id is None and reply_to_screen_name is None:
+        return None
+    return conversation_id, reply_to_tweet_id, reply_to_screen_name
+
+
+def _extract_reply_target_from_detail_payload(
+    payload: dict[str, Any],
+    tweet_id: str,
+) -> tuple[str | None, str | None] | None:
+    reply_ancestry = _extract_reply_ancestry_from_detail_payload(payload, tweet_id)
+    if reply_ancestry is None:
+        return None
+    conversation_id, reply_to_tweet_id, reply_to_screen_name = reply_ancestry
+    if conversation_id is not None:
+        conversation_author = _extract_tweet_author_screen_name(payload, conversation_id)
+        if conversation_author is not None:
+            return conversation_id, conversation_author
+    if reply_to_tweet_id is None:
+        return None
+    target_screen_name = _extract_tweet_author_screen_name(payload, reply_to_tweet_id) or reply_to_screen_name
+    if target_screen_name is None:
+        return None
+    return reply_to_tweet_id, target_screen_name
 
 
 def _derive_reply_state_from_result(result: dict[str, Any]) -> tuple[bool | None, str | None, str | None] | None:
@@ -576,3 +848,34 @@ def _deep_get(value: Any, *path: str) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _extract_tweet_author_screen_name(payload: dict[str, Any], tweet_id: str) -> str | None:
+    tweet_id = str(tweet_id)
+    for item in _walk_mappings(payload):
+        if not _matches_tweet_id(item, tweet_id):
+            continue
+        candidates = [
+            _deep_get(item, "core", "user_results", "result", "legacy", "screen_name"),
+            _deep_get(item, "tweet", "core", "user_results", "result", "legacy", "screen_name"),
+            _deep_get(item, "author", "screenName"),
+            _deep_get(item, "user", "screen_name"),
+        ]
+        for candidate in candidates:
+            normalized = _coerce_non_empty_str(candidate)
+            if normalized is not None:
+                return normalized
+    return None
+
+
+def _coerce_non_empty_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _native_error_code(exc: Exception) -> str | None:
+    if isinstance(exc, NativeTwitterError):
+        return getattr(exc, "error_code", None)
+    return None
