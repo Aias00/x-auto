@@ -111,6 +111,19 @@ class AutomationStorage:
                     FOREIGN KEY(run_id) REFERENCES runs(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS shared_engagements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workflow TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    target_tweet_id TEXT,
+                    target_author TEXT,
+                    target_tweet_url TEXT,
+                    reply_tweet_id TEXT,
+                    reply_url TEXT,
+                    followed INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS candidate_cache (
                     workflow TEXT NOT NULL,
                     tweet_id TEXT NOT NULL,
@@ -140,6 +153,15 @@ class AutomationStorage:
                 connection.execute("ALTER TABLE engagements ADD COLUMN target_tweet_url TEXT")
             if "reply_url" not in columns:
                 connection.execute("ALTER TABLE engagements ADD COLUMN reply_url TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shared_engagements_target_tweet_id ON shared_engagements(target_tweet_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shared_engagements_workflow_target ON shared_engagements(workflow, target_tweet_id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_shared_engagements_author_created ON shared_engagements(target_author, created_at)"
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_candidate_cache_workflow_status_expires ON candidate_cache(workflow, status, expires_at)"
             )
@@ -587,28 +609,84 @@ class AutomationStorage:
         reply_url: str | None,
         followed: bool,
     ) -> None:
+        created_at = utcnow()
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO engagements (run_id, target_tweet_id, target_author, target_tweet_url, reply_tweet_id, reply_url, followed, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, target_tweet_id, target_author, target_tweet_url, reply_tweet_id, reply_url, int(followed), utcnow()),
+                (run_id, target_tweet_id, target_author, target_tweet_url, reply_tweet_id, reply_url, int(followed), created_at),
+            )
+        self.record_shared_engagement(
+            workflow="feed_engage",
+            run_id=run_id,
+            target_tweet_id=target_tweet_id,
+            target_author=target_author,
+            target_tweet_url=target_tweet_url,
+            reply_tweet_id=reply_tweet_id,
+            reply_url=reply_url,
+            followed=followed,
+            created_at=created_at,
+        )
+
+    def record_shared_engagement(
+        self,
+        *,
+        workflow: str,
+        run_id: str,
+        target_tweet_id: str | None,
+        target_author: str | None,
+        target_tweet_url: str | None,
+        reply_tweet_id: str | None,
+        reply_url: str | None,
+        followed: bool,
+        created_at: str | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO shared_engagements (
+                    workflow,
+                    run_id,
+                    target_tweet_id,
+                    target_author,
+                    target_tweet_url,
+                    reply_tweet_id,
+                    reply_url,
+                    followed,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow,
+                    run_id,
+                    target_tweet_id,
+                    target_author,
+                    target_tweet_url,
+                    reply_tweet_id,
+                    reply_url,
+                    int(followed),
+                    created_at or utcnow(),
+                ),
             )
 
-    def has_target_tweet_id(self, target_tweet_id: str) -> bool:
-        with self.connect() as connection:
-            row = connection.execute(
-                """
+    def has_target_tweet_id(self, target_tweet_id: str, *, exclude_workflows: tuple[str, ...] | None = None) -> bool:
+        query = """
                 SELECT target_tweet_id
-                FROM engagements
+                FROM shared_engagements
                 WHERE target_tweet_id = ?
-                LIMIT 1
-                """,
-                (target_tweet_id,),
-            ).fetchone()
+        """
+        parameters: list[Any] = [target_tweet_id]
+        if exclude_workflows:
+            placeholders = ", ".join("?" for _ in exclude_workflows)
+            query += f" AND workflow NOT IN ({placeholders})"
+            parameters.extend(exclude_workflows)
+        query += " LIMIT 1"
+        with self.connect() as connection:
+            row = connection.execute(query, tuple(parameters)).fetchone()
         return row is not None
-
 
     def get_daily_execution_count(self, workflow: str, day: date) -> int:
         normalized = workflow.value if hasattr(workflow, "value") else str(workflow)

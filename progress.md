@@ -43,6 +43,7 @@
 - Added a scheduler-independent `POST /feed-engage/execute` route so the original feed-engage lane can now be triggered manually the same way author-alpha can.
 - Verified the new manual feed-engage route with one real execution: run `34e585ef-2082-4c5f-92bb-57992b35e36e` replied to `@sama` on tweet `2049493609028923826` with reply tweet `2049496352460337467`.
 - Cleaned the final migration/documentation residue: `TwitterClient` write methods are now guarded against duplicate definitions by regression tests, README reflects both manual execute routes and current author-alpha pacing, and this progress file no longer describes a vendored compatibility layer that has already been removed.
+- Added a shared cross-workflow engagement ledger in the main automation DB so `feed-engage` and `author-alpha` now record touched target tweets into the same table; `author-alpha` still keeps `alpha_engagements` for burst/lifetime caps, but it now skips targets that were already touched by other workflows and mirrors its successful replies into the shared ledger.
 
 ## Verification
 
@@ -104,6 +105,10 @@
 - `uv run pytest -q tests/test_project_docs.py` -> `2 passed`
 - `uv run pytest -q` -> `185 passed`
 - `python3 -m compileall src tests` -> success
+- `uv run pytest -q tests/test_author_alpha_execution.py -k "shared_engagement or already_triggered_by_feed_engage"` -> `2 passed`
+- `uv run pytest -q tests/test_smoke.py -k "run_author_alpha_request_passes_real_asyncio_sleep or author_alpha_manual_execute_route_runs_once_without_scheduler or scheduler_dispatch_creates_author_alpha_execution_run"` -> `3 passed`
+- `uv run pytest -q` -> `187 passed`
+- `python3 -m compileall src tests` -> success
 
 ## Remaining Risks
 
@@ -114,6 +119,7 @@
 - The X read/write stack is now unified through x-atuo-owned runtime/transport/spec/normalization/timeline/parser/native-client helpers; the vendored compatibility package has been removed entirely.
 - Author-alpha original-target recovery depends on X detail payloads continuing to expose either the conversation root tweet author or the direct parent author.
 - Author-alpha burst drafting currently reuses the generic AI draft interface with burst context rather than a dedicated burst-plan model surface; the lane behavior is correct and tested, but the planning semantics remain thinner than the full design aspiration.
+- The shared engagement ledger currently dedupes at the target-tweet level across workflows; if future requirements need cross-workflow coexistence on the same target, the shared ledger policy will need to become workflow-aware rather than binary.
 - If deeper historical context is needed, use the archive below.
 
 ## Archive
@@ -138,7 +144,7 @@
 
 Main achievements:
 - The service no longer depends on the external `twitter` executable or the external `/Users/aias/Work/github/twitter-cli` repo at runtime.
-- Current runtime behavior is covered by `185` passing tests.
+- Current runtime behavior is covered by `187` passing tests.
 - Local service has been restarted successfully on the final code.
 
 Future recommendations:

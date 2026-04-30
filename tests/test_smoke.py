@@ -1841,6 +1841,7 @@ def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_pat
         *,
         config,
         storage,
+        shared_storage,
         candidate_source,
         drafter,
         reply_client,
@@ -1862,6 +1863,8 @@ def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_pat
 
     storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
     storage.initialize()
+    shared_storage = automation_api.AutomationStorage(tmp_path / "shared.sqlite3")
+    shared_storage.initialize()
     request = AutomationRequest.for_author_alpha_engage(job_name="manual-author-alpha-engage", dry_run=True)
 
     result = asyncio.run(
@@ -1869,6 +1872,7 @@ def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_pat
             request,
             settings=AutomationConfig(),
             storage=storage,
+            shared_storage=shared_storage,
             endpoint="manual:author-alpha-engage",
         )
     )

@@ -273,6 +273,7 @@ async def _run_author_alpha_request(
     *,
     settings: AutomationConfig,
     storage: AuthorAlphaStorage,
+    shared_storage: AutomationStorage,
     endpoint: str,
     proxy: str | None = None,
 ) -> dict[str, Any]:
@@ -290,6 +291,7 @@ async def _run_author_alpha_request(
         request,
         config=settings,
         storage=storage,
+        shared_storage=shared_storage,
         candidate_source=notifications_client,
         drafter=ai_provider,
         reply_client=twitter_client,
@@ -302,6 +304,7 @@ async def _execute_author_alpha_job(
     *,
     settings: AutomationConfig,
     storage: AuthorAlphaStorage,
+    shared_storage: AutomationStorage,
     endpoint: str,
     job_type: str,
     payload: dict[str, Any],
@@ -336,6 +339,7 @@ async def _execute_author_alpha_job(
             request_for_run,
             settings=settings,
             storage=storage,
+            shared_storage=shared_storage,
             endpoint=endpoint,
             proxy=proxy,
         )
@@ -389,6 +393,7 @@ async def _dispatch_scheduled_request(
         return await _execute_author_alpha_job(
             settings=resolved_settings,
             storage=author_alpha_storage,
+            shared_storage=storage,
             endpoint=endpoint,
             job_type=job_type,
             payload=payload,
@@ -1253,6 +1258,7 @@ async def post_author_alpha_execute(
     result = await _execute_author_alpha_job(
         settings=settings,
         storage=storage,
+        shared_storage=get_storage(request),
         endpoint="manual:author-alpha-engage",
         job_type=job_type,
         payload=payload,

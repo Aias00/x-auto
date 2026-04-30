@@ -51,6 +51,23 @@ class ReplyClientProtocol(Protocol):
     def reply(self, tweet_id: str, text: str) -> TwitterCommandResult: ...
 
 
+class SharedEngagementStorageProtocol(Protocol):
+    def has_target_tweet_id(self, target_tweet_id: str, *, exclude_workflows: tuple[str, ...] | None = None) -> bool: ...
+    def record_shared_engagement(
+        self,
+        *,
+        workflow: str,
+        run_id: str,
+        target_tweet_id: str | None,
+        target_author: str | None,
+        target_tweet_url: str | None,
+        reply_tweet_id: str | None,
+        reply_url: str | None,
+        followed: bool,
+        created_at: str | None = None,
+    ) -> None: ...
+
+
 @dataclass(slots=True)
 class AuthorAlphaExecutionGraph:
     config: AutomationConfig
@@ -60,6 +77,7 @@ class AuthorAlphaExecutionGraph:
     reply_client: ReplyClientProtocol
     sleep: Any = None
     now: Any = None
+    shared_storage: SharedEngagementStorageProtocol | None = None
     _timezone: ZoneInfo = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -444,6 +462,8 @@ class AuthorAlphaExecutionGraph:
         return None
 
     def _queue_reason(self, candidate: FeedCandidate) -> str | None:
+        if self._shared_target_seen_by_other_workflow(candidate.tweet_id):
+            return "target already engaged by another workflow"
         if self._target_success_count(candidate.tweet_id) >= int(
             self.config.author_alpha.per_target_tweet_success_limit
         ):
@@ -613,42 +633,53 @@ class AuthorAlphaExecutionGraph:
                 metric_date=metric_date,
                 created_at=created_at,
             )
-            return
-
-        connect = getattr(self.storage, "connect", None)
-        if not callable(connect):
-            raise AttributeError("storage must provide record_engagement() or connect()")
-        with connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO alpha_engagements (
-                    run_id,
-                    target_author,
-                    target_tweet_id,
-                    target_tweet_url,
-                    reply_tweet_id,
-                    reply_url,
-                    burst_id,
-                    burst_index,
-                    burst_size,
-                    metric_date,
-                    created_at
+        else:
+            connect = getattr(self.storage, "connect", None)
+            if not callable(connect):
+                raise AttributeError("storage must provide record_engagement() or connect()")
+            with connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO alpha_engagements (
+                        run_id,
+                        target_author,
+                        target_tweet_id,
+                        target_tweet_url,
+                        reply_tweet_id,
+                        reply_url,
+                        burst_id,
+                        burst_index,
+                        burst_size,
+                        metric_date,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        target_author.strip(),
+                        target_tweet_id.strip(),
+                        target_tweet_url,
+                        reply_tweet_id.strip(),
+                        reply_url,
+                        burst_id,
+                        burst_index,
+                        burst_size,
+                        metric_date,
+                        _normalize_timestamp(created_at),
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    target_author.strip(),
-                    target_tweet_id.strip(),
-                    target_tweet_url,
-                    reply_tweet_id.strip(),
-                    reply_url,
-                    burst_id,
-                    burst_index,
-                    burst_size,
-                    metric_date,
-                    _normalize_timestamp(created_at),
-                ),
+        if self.shared_storage is not None:
+            self.shared_storage.record_shared_engagement(
+                workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE.value,
+                run_id=run_id,
+                target_tweet_id=target_tweet_id,
+                target_author=target_author,
+                target_tweet_url=target_tweet_url,
+                reply_tweet_id=reply_tweet_id,
+                reply_url=reply_url,
+                followed=False,
+                created_at=created_at,
             )
 
     def _update_burst_size(self, *, burst_id: str, burst_size: int) -> None:
@@ -693,12 +724,23 @@ class AuthorAlphaExecutionGraph:
             return None
         return f"https://x.com/{candidate.screen_name}/status/{candidate.tweet_id}"
 
+    def _shared_target_seen_by_other_workflow(self, target_tweet_id: str) -> bool:
+        if self.shared_storage is None:
+            return False
+        return bool(
+            self.shared_storage.has_target_tweet_id(
+                target_tweet_id,
+                exclude_workflows=(WorkflowKind.AUTHOR_ALPHA_ENGAGE.value,),
+            )
+        )
+
 
 async def run_author_alpha_engage(
     request: AutomationRequest,
     *,
     config: AutomationConfig,
     storage: AuthorAlphaStorageProtocol,
+    shared_storage: SharedEngagementStorageProtocol | None,
     candidate_source: DeviceFollowFeedProtocol,
     drafter: ReplyDraftProtocol,
     reply_client: ReplyClientProtocol,
@@ -708,6 +750,7 @@ async def run_author_alpha_engage(
     graph = AuthorAlphaExecutionGraph(
         config=config,
         storage=storage,
+        shared_storage=shared_storage,
         candidate_source=candidate_source,
         drafter=drafter,
         reply_client=reply_client,

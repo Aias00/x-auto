@@ -10,6 +10,7 @@ from x_atuo.automation.author_alpha_graph import AuthorAlphaExecutionGraph
 from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
 from x_atuo.automation.config import AutomationConfig, AuthorAlphaSettings
 from x_atuo.automation.state import AutomationRequest
+from x_atuo.automation.storage import AutomationStorage
 from x_atuo.core.ai_client import AIDraftResult
 from x_atuo.core.twitter_models import TweetAuthor, TweetRecord, TwitterCommandResult
 
@@ -547,6 +548,80 @@ def test_author_alpha_uses_configured_timezone_for_daily_author_cap(tmp_path: Pa
 
     assert snapshot.result is not None
     assert len(replier.calls) == 0
+
+
+def test_author_alpha_records_success_into_shared_engagement_ledger(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    shared_storage = AutomationStorage(tmp_path / "shared.sqlite3")
+    storage.initialize()
+    shared_storage.initialize()
+    _upsert_author(storage, "alpha_one", author_score=100, impressions_total_7d=100)
+
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=1, per_run_same_target_burst_limit=1),
+        storage=storage,
+        shared_storage=shared_storage,
+        candidate_source=_FakeDeviceFollowFeedClient([_feed_post("tweet-1", "alpha_one")]),
+        drafter=_FakeDrafter(),
+        reply_client=_FakeReplyClient(),
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    with shared_storage.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT workflow, target_tweet_id, target_author
+            FROM shared_engagements
+            WHERE target_tweet_id = 'tweet-1'
+            """
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == ("author-alpha-engage", "tweet-1", "alpha_one")
+
+
+def test_author_alpha_skips_target_already_triggered_by_feed_engage(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    shared_storage = AutomationStorage(tmp_path / "shared.sqlite3")
+    storage.initialize()
+    shared_storage.initialize()
+    _upsert_author(storage, "blocked_author", author_score=1000, impressions_total_7d=1000)
+    _upsert_author(storage, "open_author", author_score=500, impressions_total_7d=500)
+
+    shared_storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="feed-run-1",
+        target_tweet_id="tweet-blocked",
+        target_author="blocked_author",
+        target_tweet_url="https://x.com/blocked_author/status/tweet-blocked",
+        reply_tweet_id="reply-feed-1",
+        reply_url="https://x.com/i/status/reply-feed-1",
+        followed=False,
+        created_at="2026-04-27T00:00:00+00:00",
+    )
+
+    replier = _FakeReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=5, per_run_same_target_burst_limit=1),
+        storage=storage,
+        shared_storage=shared_storage,
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [
+                _feed_post("tweet-blocked", "blocked_author"),
+                _feed_post("tweet-open", "open_author"),
+            ]
+        ),
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-open"]
 
 
 class _FakeDeviceFollowFeedClient:
