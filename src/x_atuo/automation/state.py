@@ -16,6 +16,16 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _default_feed_options() -> "FeedOptions":
+    from x_atuo.automation.config import AutomationConfig
+
+    config = AutomationConfig()
+    return FeedOptions(
+        feed_type=config.twitter.default_feed_type,
+        feed_count=config.twitter.default_feed_count,
+    )
+
+
 class WorkflowKind(str, Enum):
     """Supported workflow types."""
 
@@ -30,6 +40,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     BLOCKED = "blocked"
     COMPLETED = "completed"
+    COMPLETED_WITH_ERRORS = "completed_with_errors"
     FAILED = "failed"
     SKIPPED = "skipped"
 
@@ -111,7 +122,7 @@ class AutomationRequest(BaseModel):
         if self.workflow is WorkflowKind.FEED_ENGAGE:
             self.approval_mode = "ai_auto"
             if self.feed_options is None:
-                self.feed_options = FeedOptions()
+                self.feed_options = _default_feed_options()
         elif self.workflow is WorkflowKind.AUTHOR_ALPHA_ENGAGE:
             self.feed_options = None
         return self
@@ -127,7 +138,7 @@ class AutomationRequest(BaseModel):
         return cls(
             workflow=WorkflowKind.FEED_ENGAGE,
             reply_text=reply_text,
-            feed_options=feed_options or FeedOptions(),
+            feed_options=feed_options or _default_feed_options(),
             **kwargs,
         )
 
@@ -197,7 +208,12 @@ class WorkflowStateModel(BaseModel):
 
     def mark_completed(self, result: ExecutionResult, *, node: str = "execute", **payload: Any) -> None:
         self.result = result
-        self.status = RunStatus.COMPLETED if result.ok else RunStatus.FAILED
+        if not result.ok:
+            self.status = RunStatus.FAILED
+        elif bool(result.detail.get("partial_success")):
+            self.status = RunStatus.COMPLETED_WITH_ERRORS
+        else:
+            self.status = RunStatus.COMPLETED
         message = "execution completed" if result.ok else "execution failed"
         self.log_event(node, message, result=result.model_dump(mode="json"), **payload)
 

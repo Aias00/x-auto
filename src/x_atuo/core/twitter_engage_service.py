@@ -127,12 +127,6 @@ class TwitterEngageService:
                     screen_name=actual_screen_name,
                     text=candidate.reply_text,
                 )
-                follow_result = TwitterCommandResult(
-                    action="follow",
-                    ok=True,
-                    dry_run=True,
-                    screen_name=actual_screen_name,
-                )
                 attempts.append(
                     CandidateAttempt(
                         candidate=resolved_candidate,
@@ -141,7 +135,6 @@ class TwitterEngageService:
                         tweet=main_tweet,
                         outcome="would_reply",
                         reply_result=reply_result,
-                        follow_result=follow_result,
                     )
                 )
                 return EngageResult(
@@ -150,7 +143,6 @@ class TwitterEngageService:
                     attempts=tuple(attempts),
                     selected_candidate=resolved_candidate,
                     reply_result=reply_result,
-                    follow_result=follow_result,
                 )
 
             reply_result = self.client.reply(candidate.tweet_id, candidate.reply_text)
@@ -188,17 +180,14 @@ class TwitterEngageService:
                     error=reply_result.error_message or str(reply_result.payload),
                 )
 
-            follow_result = self.client.follow(actual_screen_name)
             attempts.append(
                 CandidateAttempt(
                     candidate=resolved_candidate,
                     tweet_id=candidate.tweet_id,
                     screen_name=actual_screen_name,
                     tweet=main_tweet,
-                    outcome="replied" if follow_result.ok else "follow_failed",
-                    detail=follow_result.error_message,
+                    outcome="replied",
                     reply_result=reply_result,
-                    follow_result=follow_result,
                 )
             )
             return EngageResult(
@@ -207,8 +196,6 @@ class TwitterEngageService:
                 attempts=tuple(attempts),
                 selected_candidate=resolved_candidate,
                 reply_result=reply_result,
-                follow_result=follow_result,
-                error=follow_result.error_message if not follow_result.ok else None,
             )
 
         return EngageResult(

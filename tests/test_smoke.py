@@ -4,7 +4,7 @@ import asyncio
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -17,6 +17,7 @@ from x_atuo.automation.config import SchedulerSettings
 from x_atuo.automation.graph import AutomationGraph
 from x_atuo.automation.graph import WorkflowAdapters
 from x_atuo.automation.graph import _AI_MODERATION_METADATA_KEY
+from x_atuo.automation.graph import _candidate_current_day_reason
 from x_atuo.automation.graph import _build_runtime_graph
 from x_atuo.automation.policies import build_dedupe_key
 from x_atuo.automation.scheduler import AutomationScheduler
@@ -29,11 +30,22 @@ from x_atuo.automation.state import make_initial_state
 from x_atuo.automation.storage import AutomationStorage
 import x_atuo.automation.api as automation_api
 from x_atuo.core.ai_client import AIProviderError
+from x_atuo.core.ai_client import AIModerationResult
 from x_atuo.core.ai_client import OpenAICompatibleProvider
 from x_atuo.core.ai_client import build_moderation_cache_key
 from x_atuo.core.twitter_client import TwitterClient
 from x_atuo.core.twitter_client import TwitterCredentials
+from x_atuo.core.twitter_engage_service import TwitterEngageService
+from x_atuo.core.twitter_models import Candidate
 from x_atuo.core.twitter_models import TweetAuthor, TweetRecord, TwitterCommandResult
+
+
+def _current_created_at() -> datetime:
+    return datetime.now(UTC).replace(microsecond=0)
+
+
+def _current_created_at_str() -> str:
+    return _current_created_at().isoformat()
 
 
 def test_dedupe_key_is_stable() -> None:
@@ -100,6 +112,7 @@ def test_local_dotenv_overrides_shell_env(tmp_path: Path, monkeypatch) -> None:
 
 def test_feed_engage_config_defaults_are_ready_to_run() -> None:
     config = AutomationConfig()
+    default_config = AutomationConfig(_env_file=None)
     request = AutomationRequest.for_feed_engage()
 
     assert request.approval_mode == "ai_auto"
@@ -110,14 +123,155 @@ def test_feed_engage_config_defaults_are_ready_to_run() -> None:
     assert "candidate" not in AutomationRequest.model_fields
     assert "candidates" not in AutomationRequest.model_fields
     assert config.twitter.proxy_url == "http://127.0.0.1:7890"
-    assert config.twitter.default_feed_count == 10
-    assert config.twitter.default_feed_type == "for-you"
+    assert default_config.twitter.default_feed_count == 10
+    assert default_config.twitter.default_feed_type == "for-you"
+
+
+def test_twitter_client_fetch_feed_retries_transient_tls_error() -> None:
+    class FakeNative:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def fetch_home_timeline(self, *, count: int):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    "Twitter API network error: Failed to perform, curl: (35) TLS connect error: ssl"
+                )
+            author = type("Author", (), {"id": "a1", "name": "Author", "screen_name": "author1", "verified": True, "profile_image_url": ""})()
+            metrics = type("Metrics", (), {"likes": 0, "retweets": 0, "replies": 0, "quotes": 0, "views": 0, "bookmarks": 0})()
+            tweet = type(
+                "Tweet",
+                (),
+                {
+                    "id": "tweet-1",
+                    "text": "hello",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "author": author,
+                    "metrics": metrics,
+                    "lang": "en",
+                    "urls": [],
+                    "is_retweet": False,
+                    "retweeted_by": None,
+                    "is_subscriber_only": False,
+                    "is_promoted": False,
+                    "article_title": None,
+                    "article_text": None,
+                },
+            )()
+            return [tweet]
+
+    native = FakeNative()
+    client = TwitterClient(credentials=TwitterCredentials(auth_token="a", ct0="b"))
+    client._native_client = native  # type: ignore[assignment]
+
+    items = client.fetch_feed(max_items=1)
+
+    assert native.calls == 2
+    assert [item.tweet_id for item in items] == ["tweet-1"]
+
+
+def test_twitter_client_reply_retries_transient_tls_error() -> None:
+    class FakeNative:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_tweet(self, text: str, *, reply_to_id: str | None = None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError(
+                    "Twitter API network error: Failed to perform, curl: (35) TLS connect error: ssl"
+                )
+            return "reply-1"
+
+    native = FakeNative()
+    client = TwitterClient(credentials=TwitterCredentials(auth_token="a", ct0="b"))
+    client._native_client = native  # type: ignore[assignment]
+
+    result = client.reply("tweet-1", "hello")
+
+    assert native.calls == 2
+    assert result.ok is True
+    assert result.tweet_id == "reply-1"
 
 
 def test_feed_engage_request_normalizes_legacy_approval_mode_to_ai_auto() -> None:
     request = AutomationRequest.for_feed_engage(approval_mode="human_review")
 
     assert request.approval_mode == "ai_auto"
+
+
+def test_engage_candidates_does_not_follow_after_reply() -> None:
+    class FakeTweet:
+        def __init__(self, tweet_id: str, screen_name: str, *, verified: bool = True):
+            self.tweet_id = tweet_id
+            self.text = "candidate"
+            self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
+
+    class FakeClient:
+        credentials = type("Creds", (), {"ok": True})()
+
+        def __init__(self) -> None:
+            self.follow_calls: list[str] = []
+
+        def fetch_tweet(self, tweet_id: str):
+            return FakeTweet(tweet_id, "demoauthor")
+
+        def reply(self, tweet_id: str, text: str):
+            return type(
+                "Reply",
+                (),
+                {
+                    "action": "reply",
+                    "ok": True,
+                    "dry_run": False,
+                    "target_tweet_id": tweet_id,
+                    "tweet_id": "reply-123",
+                    "screen_name": "demoauthor",
+                    "text": text,
+                    "payload": {"ok": True},
+                    "error_code": None,
+                    "error_message": None,
+                },
+            )()
+
+        def follow(self, screen_name: str):
+            self.follow_calls.append(screen_name)
+            return type(
+                "Follow",
+                (),
+                {
+                    "action": "follow",
+                    "ok": True,
+                    "dry_run": False,
+                    "target_tweet_id": None,
+                    "tweet_id": None,
+                    "screen_name": screen_name,
+                    "text": None,
+                    "payload": {"ok": True},
+                    "error_code": None,
+                    "error_message": None,
+                },
+            )()
+
+    client = FakeClient()
+    service = TwitterEngageService(client)
+
+    result = service.engage_candidates(
+        [
+            Candidate(
+                tweet_id="111",
+                screen_name="demoauthor",
+                reply_text="hello",
+            )
+        ]
+    )
+
+    assert result.ok is True
+    assert result.status == "executed"
+    assert result.attempts[0].outcome == "replied"
+    assert result.follow_result is None
+    assert client.follow_calls == []
 
 
 def test_candidate_refresh_rounds_comes_from_policy_config() -> None:
@@ -191,10 +345,18 @@ def test_policy_guard_releases_unused_claimed_candidates_after_early_stop() -> N
         def has_target_tweet_id(self, target_tweet_id: str) -> bool:
             return False
 
-        def release_claimed_candidate_cache(self, *, workflow: str, run_id: str, tweet_ids: list[str]) -> int:
+        def release_claimed_candidate_cache(
+            self,
+            *,
+            workflow: str,
+            run_id: str,
+            tweet_ids: list[str],
+            reason_by_tweet_id: dict[str, str] | None = None,
+        ) -> int:
             released["workflow"] = workflow
             released["run_id"] = run_id
             released["tweet_ids"] = tweet_ids
+            released["reason_by_tweet_id"] = reason_by_tweet_id
             return len(tweet_ids)
 
     graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=FakeHooks()))
@@ -222,10 +384,14 @@ def test_policy_guard_releases_unused_claimed_candidates_after_early_stop() -> N
         "workflow": "feed_engage",
         "run_id": "run-123",
         "tweet_ids": ["222", "333"],
+        "reason_by_tweet_id": {
+            "222": "released without attempt after another candidate was selected",
+            "333": "released without attempt after another candidate was selected",
+        },
     }
     assert any(
         event.node == "policy_guard"
-        and event.message == "unused claimed candidates released"
+        and event.message == "claimed candidates released"
         and event.payload["count"] == 2
         and event.payload["tweet_ids"] == ["222", "333"]
         for event in result["snapshot"].events
@@ -248,10 +414,18 @@ def test_policy_guard_retries_duplicate_candidate_before_releasing_claims() -> N
         def has_target_tweet_id(self, target_tweet_id: str) -> bool:
             return False
 
-        def release_claimed_candidate_cache(self, *, workflow: str, run_id: str, tweet_ids: list[str]) -> int:
+        def release_claimed_candidate_cache(
+            self,
+            *,
+            workflow: str,
+            run_id: str,
+            tweet_ids: list[str],
+            reason_by_tweet_id: dict[str, str] | None = None,
+        ) -> int:
             released["workflow"] = workflow
             released["run_id"] = run_id
             released["tweet_ids"] = tweet_ids
+            released["reason_by_tweet_id"] = reason_by_tweet_id
             return len(tweet_ids)
 
     graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=FakeHooks()))
@@ -286,8 +460,20 @@ def test_prefilter_candidates_filters_unverified_without_policy_hooks() -> None:
     state = make_initial_state(request)
     snapshot = state["snapshot"]
     snapshot.candidates = [
-        FeedCandidate(tweet_id="111", screen_name="ghost", text="candidate", author_verified=False),
-        FeedCandidate(tweet_id="222", screen_name="real", text="candidate", author_verified=True),
+        FeedCandidate(
+            tweet_id="111",
+            screen_name="ghost",
+            text="candidate",
+            author_verified=False,
+            metadata={"created_at": _current_created_at_str()},
+        ),
+        FeedCandidate(
+            tweet_id="222",
+            screen_name="real",
+            text="candidate",
+            author_verified=True,
+            metadata={"created_at": _current_created_at_str()},
+        ),
     ]
 
     result = asyncio.run(graph.prefilter_candidates(state))
@@ -312,8 +498,16 @@ def test_prefilter_candidates_filters_reply_restricted_before_selection() -> Non
             author_verified=True,
             can_reply=False,
             reply_limit_reason="Only some accounts can reply.",
+            metadata={"created_at": _current_created_at_str()},
         ),
-        FeedCandidate(tweet_id="222", screen_name="open", text="candidate", author_verified=True, can_reply=True),
+        FeedCandidate(
+            tweet_id="222",
+            screen_name="open",
+            text="candidate",
+            author_verified=True,
+            can_reply=True,
+            metadata={"created_at": _current_created_at_str()},
+        ),
     ]
 
     result = asyncio.run(graph.prefilter_candidates(state))
@@ -325,6 +519,61 @@ def test_prefilter_candidates_filters_reply_restricted_before_selection() -> Non
         and event.payload["reason"] == "Only some accounts can reply."
         for event in result["snapshot"].events
     )
+
+
+def test_prefilter_candidates_filters_non_current_day_tweets() -> None:
+    graph = AutomationGraph(AutomationConfig(), WorkflowAdapters(policy_hooks=None))
+    request = AutomationRequest.for_feed_engage(job_name="job")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    now_utc = datetime.now(UTC)
+    today_str = now_utc.isoformat()
+    yesterday_str = (now_utc - timedelta(days=1)).isoformat()
+    snapshot.candidates = [
+        FeedCandidate(
+            tweet_id="111",
+            screen_name="old",
+            text="candidate",
+            author_verified=True,
+            metadata={"created_at": yesterday_str},
+        ),
+        FeedCandidate(
+            tweet_id="222",
+            screen_name="new",
+            text="candidate",
+            author_verified=True,
+            metadata={"created_at": today_str},
+        ),
+    ]
+
+    result = asyncio.run(graph.prefilter_candidates(state))
+
+    assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["222"]
+    assert any(
+        event.node == "prefilter_candidates"
+        and event.message == "candidate removed before selection"
+        and event.payload["reason"] == "tweet not from its local current day"
+        for event in result["snapshot"].events
+    )
+
+
+def test_candidate_current_day_reason_uses_tweet_timezone() -> None:
+    candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="tz",
+        text="candidate",
+        author_verified=True,
+        metadata={"created_at": "2026-05-01T00:30:00+09:00"},
+    )
+
+    assert _candidate_current_day_reason(
+        candidate,
+        now=datetime.fromisoformat("2026-04-30T16:00:00+00:00"),
+    ) is None
+    assert _candidate_current_day_reason(
+        candidate,
+        now=datetime.fromisoformat("2026-05-01T16:00:00+00:00"),
+    ) == "tweet not from its local current day"
 
 
 def test_prefilter_candidates_preserves_reply_restriction_reason_when_pool_is_exhausted() -> None:
@@ -343,6 +592,7 @@ def test_prefilter_candidates_preserves_reply_restriction_reason_when_pool_is_ex
             author_verified=True,
             can_reply=False,
             reply_limit_reason="Only some accounts can reply.",
+            metadata={"created_at": _current_created_at_str()},
         ),
     ]
 
@@ -720,6 +970,7 @@ def test_candidate_cache_release_claimed_entries_returns_to_pending(tmp_path: Pa
         workflow="feed_engage",
         run_id="run_claim_1",
         tweet_ids=["111"],
+        reason_by_tweet_id={"111": "released without attempt after another candidate was selected"},
     )
     reclaimed = storage.claim_pending_candidate_cache(
         workflow="feed_engage",
@@ -731,6 +982,7 @@ def test_candidate_cache_release_claimed_entries_returns_to_pending(tmp_path: Pa
     assert [item["tweet_id"] for item in claimed] == ["222", "111"]
     assert released == 1
     assert [item["tweet_id"] for item in reclaimed] == ["111"]
+    assert reclaimed[0]["reason"] == "released without attempt after another candidate was selected"
 
 
 def test_candidate_cache_cleanup_releases_expired_claims(tmp_path: Path) -> None:
@@ -886,7 +1138,7 @@ def test_scheduler_dispatch_creates_author_alpha_execution_run(monkeypatch, tmp_
                     {
                         "id": "tweet-1",
                         "text": "hello world",
-                        "created_at": "2026-04-27T00:00:00Z",
+                        "created_at": _current_created_at_str(),
                         "url": "https://x.com/alpha_one/status/tweet-1",
                         "author": {
                             "screen_name": "alpha_one",
@@ -1133,7 +1385,8 @@ def test_scheduler_dispatch_creates_feed_engage_run(monkeypatch, tmp_path: Path)
         def __init__(self, tweet_id: str, screen_name: str, text: str = "demo", verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
-            self.raw = {"id": tweet_id, "text": text}
+            self.created_at = _current_created_at()
+            self.raw = {"id": tweet_id, "text": text, "created_at": self.created_at.isoformat()}
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
             self.screen_name = screen_name
             self.verified = verified
@@ -1203,7 +1456,8 @@ def test_scheduler_dispatch_fails_without_ai_provider(monkeypatch, tmp_path: Pat
         def __init__(self, tweet_id: str, screen_name: str, text: str = "demo", verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
-            self.raw = {"id": tweet_id, "text": text}
+            self.created_at = _current_created_at()
+            self.raw = {"id": tweet_id, "text": text, "created_at": self.created_at.isoformat()}
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
             self.screen_name = screen_name
             self.verified = verified
@@ -1259,7 +1513,8 @@ def test_scheduler_dispatch_persists_reply_restriction_reason_in_run_payload(mon
         def __init__(self, tweet_id: str, screen_name: str, text: str = "demo", verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
-            self.raw = {"id": tweet_id, "text": text}
+            self.created_at = _current_created_at()
+            self.raw = {"id": tweet_id, "text": text, "created_at": self.created_at.isoformat()}
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
             self.screen_name = screen_name
             self.verified = verified
@@ -1723,7 +1978,7 @@ def test_author_alpha_manual_execute_route_runs_once_without_scheduler(tmp_path:
                     {
                         "id": "tweet-1",
                         "text": "hello world",
-                        "created_at": "2026-04-27T00:00:00Z",
+                        "created_at": _current_created_at_str(),
                         "url": "https://x.com/alpha_one/status/tweet-1",
                         "author": {
                             "screen_name": "alpha_one",
@@ -1879,6 +2134,14 @@ def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_pat
 
     assert result["status"] == "completed"
     assert captured["sleep"] is asyncio.sleep
+
+
+def test_derive_status_maps_completed_with_errors_to_completed() -> None:
+    assert automation_api._derive_status({"status": "completed_with_errors"}) == "completed"
+
+
+def test_derive_status_maps_skipped_to_skipped() -> None:
+    assert automation_api._derive_status({"status": "skipped"}) == "skipped"
 
 
 def test_openai_compatible_provider_parses_fenced_json() -> None:
@@ -2109,9 +2372,11 @@ def test_runtime_draft_metrics_use_compact_prompt_payload(monkeypatch, tmp_path:
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
                 "media": [{"type": "photo", "url": "https://example.com/image.jpg"}],
                 "internal": "large ignored field",
@@ -2266,9 +2531,11 @@ def test_runtime_observability_does_not_mutate_request_metadata(monkeypatch, tmp
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
             }
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
@@ -2344,9 +2611,11 @@ def test_runtime_select_candidate_uses_single_candidate_moderation_before_policy
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
             }
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
@@ -2405,9 +2674,11 @@ def test_runtime_select_candidate_stops_after_first_allowed_candidate(monkeypatc
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
             }
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
@@ -2503,9 +2774,11 @@ def test_runtime_select_candidate_checks_next_candidate_after_rejection(monkeypa
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
             }
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
@@ -2639,9 +2912,11 @@ def test_runtime_cached_moderation_misses_when_non_text_payload_changes(monkeypa
         def __init__(self, tweet_id: str, screen_name: str, text: str, topic: str):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "topic": topic,
                 "author": {"screenName": screen_name, "verified": True},
             }
@@ -2676,13 +2951,20 @@ def test_runtime_cached_moderation_misses_when_non_text_payload_changes(monkeypa
             return type("Draft", (), {"text": "short reply", "rationale": "test"})()
 
     text = "same text"
+    stale_created_at = _current_created_at_str()
     stale_candidate = FeedCandidate(
         tweet_id="111",
         screen_name="builder1",
         text=text,
-        created_at=datetime.fromisoformat("2026-04-20T03:35:55+00:00"),
+        created_at=datetime.fromisoformat(stale_created_at),
         author_verified=True,
-        metadata={"id": "111", "text": text, "topic": "stale", "author": {"screenName": "builder1", "verified": True}},
+        metadata={
+            "id": "111",
+            "text": text,
+            "created_at": stale_created_at,
+            "topic": "stale",
+            "author": {"screenName": "builder1", "verified": True},
+        },
     )
     storage = AutomationStorage(tmp_path / "runtime-moderation-cache-miss.sqlite3")
     storage.initialize()
@@ -2691,15 +2973,16 @@ def test_runtime_cached_moderation_misses_when_non_text_payload_changes(monkeypa
         source_run_id="source-run",
         candidates=[
             {
-                "tweet_id": "111",
-                "screen_name": "builder1",
-                "created_at": "2026-04-20T03:35:55+00:00",
-                "text": text,
-                "metadata": {
-                    "id": "111",
+                    "tweet_id": "111",
+                    "screen_name": "builder1",
+                    "created_at": stale_created_at,
                     "text": text,
-                    "topic": "stale",
-                    "author": {"screenName": "builder1", "verified": True},
+                    "metadata": {
+                        "id": "111",
+                        "text": text,
+                        "created_at": stale_created_at,
+                        "topic": "stale",
+                        "author": {"screenName": "builder1", "verified": True},
                     _AI_MODERATION_METADATA_KEY: {
                         "tweet_id": "111",
                         "cache_key": build_moderation_cache_key(stale_candidate, provider="none", model=None),
@@ -2793,14 +3076,16 @@ def test_feed_engage_select_candidate_fails_when_candidate_evaluation_errors() -
     assert routed == "finalize"
 
 
-def test_runtime_select_candidate_reports_moderation_failure_as_candidate_evaluation(monkeypatch, tmp_path: Path) -> None:
+def test_runtime_select_candidate_skips_transient_moderation_failure_and_tries_next(monkeypatch, tmp_path: Path) -> None:
     class FakeTweet:
         def __init__(self, tweet_id: str, screen_name: str, text: str, verified: bool = True):
             self.tweet_id = tweet_id
             self.text = text
+            self.created_at = _current_created_at()
             self.raw = {
                 "id": tweet_id,
                 "text": text,
+                "created_at": self.created_at.isoformat(),
                 "author": {"screenName": screen_name, "verified": verified},
             }
             self.author = type("Author", (), {"screen_name": screen_name, "verified": verified})()
@@ -2815,17 +3100,38 @@ def test_runtime_select_candidate_reports_moderation_failure_as_candidate_evalua
         credentials = type("Creds", (), {"ok": True})()
 
         def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None):
-            return [FakeTweet("111", "builder1", "preview")]
+            return [
+                FakeTweet("111", "builder1", "preview"),
+                FakeTweet("222", "builder2", "second preview"),
+            ]
 
         def fetch_tweet(self, tweet_id: str):
-            return FakeTweet(tweet_id, "builder1", "full api detail")
+            if tweet_id == "111":
+                return FakeTweet(tweet_id, "builder1", "full api detail")
+            return FakeTweet(tweet_id, "builder2", "second full detail")
 
     class FakeAIProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
         def moderate_candidates(self, candidates):
-            raise AIProviderError("moderation unavailable")
+            self.calls += 1
+            if self.calls == 1:
+                raise AIProviderError("AI request failed: HTTP Error 500: Internal Server Error")
+            return [
+                AIModerationResult(
+                    tweet_id=candidates[0].tweet_id,
+                    allowed=True,
+                    category=None,
+                    reason="ok",
+                )
+            ]
 
         def draft_reply(self, candidate, context=None):
             return type("Draft", (), {"text": "short reply", "rationale": "test"})()
+
+        def classify_reply_style(self, candidate):
+            return type("Style", (), {"style": "technical", "reason": "test"})()
 
     monkeypatch.setattr("x_atuo.automation.graph.TwitterClient.from_config", lambda *args, **kwargs: FakeClient())
     monkeypatch.setattr("x_atuo.automation.graph.build_ai_provider", lambda settings: FakeAIProvider())
@@ -2840,12 +3146,14 @@ def test_runtime_select_candidate_reports_moderation_failure_as_candidate_evalua
 
     snapshot = asyncio.run(graph.invoke(request))
 
-    assert snapshot.status is RunStatus.FAILED
-    assert "candidate evaluation failed: moderation unavailable" in snapshot.errors
+    assert snapshot.status is RunStatus.COMPLETED
+    assert snapshot.selected_candidate is not None
+    assert snapshot.selected_candidate.tweet_id == "222"
     assert any(
         event.node == "select_candidate"
-        and event.message == "candidate evaluation failed"
-        and event.payload["error"] == "moderation unavailable"
+        and event.message == "candidate moderation transient failure"
+        and event.payload["tweet_id"] == "111"
+        and "HTTP Error 500" in event.payload["error"]
         for event in snapshot.events
     )
 
@@ -2875,6 +3183,40 @@ def test_feed_engage_draft_text_fails_when_ai_draft_errors() -> None:
     assert "ai draft failed: draft unavailable" in result["snapshot"].errors
     assert result["snapshot"].rendered_text is None
     assert routed == "blocked"
+
+
+def test_feed_engage_draft_text_retries_transient_timeout_once() -> None:
+    calls = {"count": 0}
+
+    def flaky_draft(snapshot):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise AIProviderError("AI request failed: The read operation timed out")
+        return "draft ok"
+
+    graph = AutomationGraph(
+        AutomationConfig(),
+        WorkflowAdapters(draft_reply=flaky_draft),
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.selected_candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="author1",
+        text="preview one",
+        author_verified=True,
+    )
+
+    result = asyncio.run(graph.draft_text(state))
+
+    assert calls["count"] == 2
+    assert result["snapshot"].rendered_text == "draft ok"
+    assert any(
+        event.node == "draft_reply"
+        and event.message == "retrying transient ai draft failure"
+        for event in result["snapshot"].events
+    )
 
 
 def test_feed_engage_execute_refreshes_after_no_candidate_succeeded() -> None:
@@ -2922,3 +3264,103 @@ def test_feed_engage_execute_refreshes_after_no_candidate_succeeded() -> None:
         and event.message == "execution deferred to candidate refresh"
         for event in result["snapshot"].events
     )
+
+
+def test_feed_engage_execute_rejects_selected_candidate_with_specific_attempt_reason() -> None:
+    captured: dict[str, object] = {}
+
+    class FakeHooks:
+        def consume_candidate_cache(self, *, workflow: str, tweet_id: str) -> None:
+            raise AssertionError(f"consume should not be called for {workflow}:{tweet_id}")
+
+        def reject_candidate_cache(self, *, workflow: str, tweet_id: str, reason: str, expires_at: str) -> None:
+            captured["workflow"] = workflow
+            captured["tweet_id"] = tweet_id
+            captured["reason"] = reason
+
+    graph = AutomationGraph(
+        AutomationConfig(),
+        WorkflowAdapters(
+            execute_engage=lambda snapshot: ExecutionResult(
+                action="engage",
+                ok=False,
+                dry_run=False,
+                error="No candidate succeeded",
+                detail={"attempts": [{"tweet_id": "111", "screen_name": "author1", "outcome": "reply_restricted", "detail": None}]},
+            ),
+            policy_hooks=FakeHooks(),
+        ),
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", dry_run=False)
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.candidates = [FeedCandidate(tweet_id="111", screen_name="author1", text="preview", author_verified=True)]
+    snapshot.selected_candidate = snapshot.candidates[0]
+    snapshot.selection_source = "ai"
+    snapshot.selection_reason = "picked one"
+    snapshot.reply_context = {"reply_style": "technical"}
+    snapshot.rendered_text = "draft one"
+    snapshot.drafting_source = "ai"
+    snapshot.candidate_cache_persisted = True
+
+    result = asyncio.run(graph.execute(state))
+
+    assert result["snapshot"].candidate_refresh_pending is True
+    assert captured == {
+        "workflow": "feed_engage",
+        "tweet_id": "111",
+        "reason": "reply restricted",
+    }
+
+
+def test_feed_engage_select_candidate_marks_no_candidate_as_blocked_and_releases_claims() -> None:
+    released: dict[str, object] = {}
+
+    class FakeHooks:
+        def release_claimed_candidate_cache(
+            self,
+            *,
+            workflow: str,
+            run_id: str,
+            tweet_ids: list[str],
+            reason_by_tweet_id: dict[str, str] | None = None,
+        ) -> int:
+            released["workflow"] = workflow
+            released["run_id"] = run_id
+            released["tweet_ids"] = tweet_ids
+            released["reason_by_tweet_id"] = reason_by_tweet_id
+            return len(tweet_ids)
+
+    graph = AutomationGraph(
+        AutomationConfig(policies=PolicyConfig(candidate_refresh_rounds=0)),
+        WorkflowAdapters(select_candidate=lambda snapshot: None, policy_hooks=FakeHooks()),
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", run_id="run-123")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.candidates = [
+        FeedCandidate(
+            tweet_id="111",
+            screen_name="author1",
+            text="preview one",
+            author_verified=True,
+            metadata={"_x_atuo_candidate_cache": True, "_x_atuo_claim_run_id": "run-123"},
+        ),
+    ]
+
+    result = asyncio.run(graph.select_candidate(state))
+    routed = graph.route_after_selection(result)
+
+    assert result["snapshot"].status is RunStatus.BLOCKED
+    assert result["snapshot"].selected_candidate is None
+    assert result["snapshot"].candidates == []
+    assert "no candidate available for engagement" in result["snapshot"].errors
+    assert routed == "blocked"
+    assert released == {
+        "workflow": "feed_engage",
+        "run_id": "run-123",
+        "tweet_ids": ["111"],
+        "reason_by_tweet_id": {
+            "111": "released without attempt because no candidate was available for engagement",
+        },
+    }

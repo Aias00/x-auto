@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.parse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 from collections.abc import Mapping, Sequence
@@ -32,6 +33,24 @@ def _format_cli_error(cmd: Sequence[str], stdout: str, stderr: str) -> str:
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}"
     )
+
+
+def _is_retryable_network_message(message: str) -> bool:
+    normalized = message.lower()
+    retryable_markers = (
+        "timed out",
+        "timeout",
+        "tls connect error",
+        "curl: (35)",
+        "ssl",
+        "unexpected eof",
+        "eof occurred",
+        "remote end closed connection",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(marker in normalized for marker in retryable_markers)
 
 
 @dataclass(slots=True, frozen=True)
@@ -119,15 +138,30 @@ class TwitterClient:
             env["HTTPS_PROXY"] = self.proxy
         return env
 
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        return _is_retryable_network_message(str(exc))
+
+    def _call_with_retries(self, fn, *, max_attempts: int = 2):
+        attempt = 1
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if attempt >= max_attempts or not self._is_retryable_error(exc):
+                    raise
+                time.sleep(0.25 * attempt)
+                attempt += 1
+
     def fetch_feed(self, *, max_items: int = 5, feed_type: str | None = None) -> list[TweetRecord]:
         if max_items < 1:
             raise ValueError("max_items must be >= 1")
         try:
             native = self._build_native_client()
             if feed_type == "following":
-                tweets = native.fetch_following_feed(count=max_items)
+                tweets = self._call_with_retries(lambda: native.fetch_following_feed(count=max_items))
             else:
-                tweets = native.fetch_home_timeline(count=max_items)
+                tweets = self._call_with_retries(lambda: native.fetch_home_timeline(count=max_items))
         except Exception as exc:
             raise TwitterClientError(f"Failed to fetch feed: {exc}") from exc
         items = [self._tweet_record_from_native(tweet) for tweet in tweets]
@@ -345,7 +379,10 @@ class TwitterClient:
 
     def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
         try:
-            created_tweet_id = self._build_native_client().create_tweet(text, reply_to_id=tweet_id)
+            native = self._build_native_client()
+            created_tweet_id = self._call_with_retries(
+                lambda: native.create_tweet(text, reply_to_id=tweet_id)
+            )
         except Exception as exc:
             return TwitterCommandResult(
                 action="reply",

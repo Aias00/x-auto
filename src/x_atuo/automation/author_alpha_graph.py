@@ -7,6 +7,7 @@ import random
 import ssl
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from http.client import RemoteDisconnected
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
@@ -32,6 +33,26 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _parse_created_at_with_original_timezone(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else None
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(text)
+        return parsed if parsed.tzinfo else None
+    except (TypeError, ValueError, IndexError):
+        return None
 
 
 class AuthorAlphaStorageProtocol(Protocol):
@@ -105,7 +126,7 @@ class AuthorAlphaExecutionGraph:
             ordered_screen_names=[str(author.get("screen_name") or "") for author in authors],
         )
 
-        post_queue = await self._build_post_queue(authors)
+        post_queue = await self._build_post_queue(authors, snapshot=snapshot)
         max_targets = max(1, int(self.config.author_alpha.max_targets_per_run))
         post_queue = post_queue[:max_targets]
         snapshot.log_event(
@@ -177,6 +198,28 @@ class AuthorAlphaExecutionGraph:
             "sent_replies": sent_replies,
             "skipped_targets": skipped_targets,
         }
+        successful_target_ids = {str(item.get("target_tweet_id") or "").strip() for item in sent_replies if str(item.get("target_tweet_id") or "").strip()}
+        failed_target_ids = {
+            str(item.get("tweet_id") or "").strip()
+            for item in skipped_targets
+            if str(item.get("tweet_id") or "").strip()
+        }
+        attempted_target_ids = successful_target_ids | failed_target_ids
+        successful_target_count = len(successful_target_ids)
+        failed_target_count = len(failed_target_ids)
+        attempted_target_count = len(attempted_target_ids)
+        partial_success = bool(successful_target_count and failed_target_count)
+        detail.update(
+            {
+                "attempted_target_count": attempted_target_count,
+                "successful_target_count": successful_target_count,
+                "failed_target_count": failed_target_count,
+                "target_failure_rate": (
+                    failed_target_count / attempted_target_count if attempted_target_count > 0 else 0.0
+                ),
+                "partial_success": partial_success,
+            }
+        )
         result = ExecutionResult(
             action="author_alpha_engage",
             ok=bool(sent_replies),
@@ -189,7 +232,9 @@ class AuthorAlphaExecutionGraph:
             error=None if sent_replies else "no author-alpha replies sent",
         )
         snapshot.result = result
-        if sent_replies:
+        if partial_success:
+            snapshot.status = RunStatus.COMPLETED_WITH_ERRORS
+        elif sent_replies:
             snapshot.status = RunStatus.COMPLETED
         else:
             snapshot.status = RunStatus.SKIPPED
@@ -218,7 +263,12 @@ class AuthorAlphaExecutionGraph:
         )
         return authors
 
-    async def _build_post_queue(self, authors: list[dict[str, Any]]) -> list[FeedCandidate]:
+    async def _build_post_queue(
+        self,
+        authors: list[dict[str, Any]],
+        *,
+        snapshot: WorkflowStateModel | None = None,
+    ) -> list[FeedCandidate]:
         author_map = {
             str(author.get("screen_name") or "").strip(): author
             for author in authors
@@ -238,6 +288,7 @@ class AuthorAlphaExecutionGraph:
         }
         queue: list[FeedCandidate] = []
         seen_tweet_ids: set[str] = set()
+        skipped_non_current_day = 0
         for post in raw_posts if isinstance(raw_posts, list) else []:
             if not isinstance(post, dict):
                 continue
@@ -257,6 +308,18 @@ class AuthorAlphaExecutionGraph:
                 can_reply=True,
                 metadata=dict(post),
             )
+            current_day_reason = self._candidate_current_day_reason(candidate)
+            if current_day_reason is not None:
+                skipped_non_current_day += 1
+                if snapshot is not None:
+                    snapshot.log_event(
+                        "build_queue",
+                        "candidate skipped before queue",
+                        tweet_id=candidate.tweet_id,
+                        screen_name=candidate.screen_name,
+                        reason=current_day_reason,
+                    )
+                continue
             queue.append(candidate)
             seen_tweet_ids.add(tweet_id)
         queue.sort(
@@ -268,6 +331,13 @@ class AuthorAlphaExecutionGraph:
                 candidate.tweet_id,
             )
         )
+        if skipped_non_current_day and snapshot is not None:
+            snapshot.log_event(
+                "build_queue",
+                "non-current-day candidates removed",
+                removed=skipped_non_current_day,
+                remaining=len(queue),
+            )
         return [candidate for candidate in queue if self._queue_reason(candidate) is None]
 
     async def _execute_candidate_burst(
@@ -459,6 +529,23 @@ class AuthorAlphaExecutionGraph:
             self.config.author_alpha.per_target_tweet_success_limit
         ):
             return "target lifetime success limit reached"
+        return None
+
+    def _candidate_current_day_reason(self, candidate: FeedCandidate) -> str | None:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        raw_created_at = None
+        for key in ("created_at", "createdAt", "timestamp", "published_at", "publishedAt"):
+            if key in metadata:
+                raw_created_at = metadata.get(key)
+                break
+        created_at = _parse_created_at_with_original_timezone(raw_created_at)
+        if created_at is None:
+            created_at = candidate.created_at if isinstance(candidate.created_at, datetime) and candidate.created_at.tzinfo else None
+        if created_at is None:
+            return "tweet created_at missing or invalid"
+        anchor = self._now().astimezone(created_at.tzinfo) if created_at.tzinfo else self._now()
+        if anchor.date() != created_at.date():
+            return "tweet not from its local current day"
         return None
 
     def _queue_reason(self, candidate: FeedCandidate) -> str | None:

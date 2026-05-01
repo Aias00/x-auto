@@ -787,7 +787,9 @@ def _normalize_result(result: Any) -> Any:
 
 def _derive_status(result: Any) -> str:
     if isinstance(result, dict):
-        if result.get("status") in {"queued", "running", "completed", "failed", "blocked"}:
+        if result.get("status") == "completed_with_errors":
+            return "completed"
+        if result.get("status") in {"queued", "running", "completed", "failed", "blocked", "skipped"}:
             return str(result["status"])
         if result.get("ok") is False:
             return "failed"
@@ -797,7 +799,7 @@ def _derive_status(result: Any) -> str:
 def _derive_error_message(result: Any, *, run_status: str, current_error: str | None) -> str | None:
     if current_error is not None:
         return current_error
-    if run_status != "blocked" or not isinstance(result, dict):
+    if run_status not in {"blocked", "skipped"} or not isinstance(result, dict):
         return None
     errors = result.get("errors")
     if not isinstance(errors, list):

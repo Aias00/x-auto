@@ -493,22 +493,31 @@ class AutomationStorage:
         workflow: str,
         run_id: str,
         tweet_ids: list[str],
+        reason_by_tweet_id: dict[str, str] | None = None,
     ) -> int:
         if not tweet_ids:
             return 0
         now = utcnow()
-        placeholders = ", ".join("?" for _ in tweet_ids)
         with self.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(
-                f"""
-                UPDATE candidate_cache
-                SET status = 'pending', claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
-                WHERE workflow = ? AND claim_run_id = ? AND status = 'claimed' AND tweet_id IN ({placeholders})
-                """,
-                (now, workflow, run_id, *tweet_ids),
-            )
-            return int(cursor.rowcount or 0)
+            released = 0
+            for tweet_id in tweet_ids:
+                cursor = connection.execute(
+                    """
+                    UPDATE candidate_cache
+                    SET status = 'pending', reason = ?, claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+                    WHERE workflow = ? AND claim_run_id = ? AND status = 'claimed' AND tweet_id = ?
+                    """,
+                    (
+                        None if reason_by_tweet_id is None else reason_by_tweet_id.get(tweet_id),
+                        now,
+                        workflow,
+                        run_id,
+                        tweet_id,
+                    ),
+                )
+                released += int(cursor.rowcount or 0)
+            return released
 
     def reject_candidate_cache(self, *, workflow: str, tweet_id: str, reason: str, expires_at: str) -> None:
         with self.connect() as connection:

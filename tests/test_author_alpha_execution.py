@@ -9,7 +9,7 @@ from urllib.error import URLError
 from x_atuo.automation.author_alpha_graph import AuthorAlphaExecutionGraph
 from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
 from x_atuo.automation.config import AutomationConfig, AuthorAlphaSettings
-from x_atuo.automation.state import AutomationRequest
+from x_atuo.automation.state import AutomationRequest, RunStatus
 from x_atuo.automation.storage import AutomationStorage
 from x_atuo.core.ai_client import AIDraftResult
 from x_atuo.core.twitter_models import TweetAuthor, TweetRecord, TwitterCommandResult
@@ -74,6 +74,42 @@ def test_author_alpha_excludes_configured_authors_from_queue(tmp_path: Path) -> 
     assert snapshot.result is not None
     assert feed.calls == [50]
     assert [call["tweet_id"] for call in replier.calls] == ["tweet-open"]
+
+
+def test_author_alpha_skips_non_current_day_posts_before_queue(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "old_author", author_score=1000, impressions_total_7d=1000)
+    _upsert_author(storage, "today_author", author_score=900, impressions_total_7d=900)
+
+    feed = _FakeDeviceFollowFeedClient(
+        [
+            _feed_post("tweet-old", "old_author", created_at="2026-04-26T23:50:00Z"),
+            _feed_post("tweet-today", "today_author", created_at="2026-04-27T00:10:00Z"),
+        ]
+    )
+    replier = _FakeReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=feed,
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+        now=lambda: datetime(2026, 4, 27, 1, 0, tzinfo=UTC),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-today"]
+    assert any(
+        event.node == "build_queue"
+        and event.message == "candidate skipped before queue"
+        and event.payload["tweet_id"] == "tweet-old"
+        and event.payload["reason"] == "tweet not from its local current day"
+        for event in snapshot.events
+    )
 
 
 def test_author_alpha_same_target_burst_replies_three_times_then_consumes_target(tmp_path: Path) -> None:
@@ -166,8 +202,8 @@ def test_author_alpha_skips_recently_processed_target_until_revisit_cooldown_exp
 
     feed = _FakeDeviceFollowFeedClient(
         [
-            _feed_post("tweet-hot", "high_author"),
-            _feed_post("tweet-mid", "mid_author"),
+            _feed_post("tweet-hot", "high_author", created_at="2026-04-27T00:40:00Z"),
+            _feed_post("tweet-mid", "mid_author", created_at="2026-04-27T00:45:00Z"),
         ]
     )
     replier = _FakeReplyClient()
@@ -209,8 +245,8 @@ def test_author_alpha_allows_target_again_after_revisit_cooldown(tmp_path: Path)
 
     feed = _FakeDeviceFollowFeedClient(
         [
-            _feed_post("tweet-hot", "high_author"),
-            _feed_post("tweet-mid", "mid_author"),
+            _feed_post("tweet-hot", "high_author", created_at="2026-04-27T00:40:00Z"),
+            _feed_post("tweet-mid", "mid_author", created_at="2026-04-27T00:45:00Z"),
         ]
     )
     replier = _FakeReplyClient()
@@ -240,7 +276,9 @@ def test_author_alpha_waits_between_targets(tmp_path: Path) -> None:
     for i in range(1, 4):
         _upsert_author(storage, f"author_{i}", author_score=100 - i, impressions_total_7d=100 - i)
 
-    feed = _FakeDeviceFollowFeedClient([_feed_post(f"tweet-{i}", f"author_{i}") for i in range(1, 4)])
+    feed = _FakeDeviceFollowFeedClient(
+        [_feed_post(f"tweet-{i}", f"author_{i}") for i in range(1, 4)]
+    )
     sleep = _SleepRecorder()
     graph = AuthorAlphaExecutionGraph(
         config=_config(max_targets_per_run=3, per_run_same_target_burst_limit=1, target_switch_delay_seconds=10),
@@ -323,12 +361,74 @@ def test_author_alpha_continues_after_retryable_candidate_failure(tmp_path: Path
     snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
 
     assert snapshot.result is not None
-    assert snapshot.status.value == "completed"
+    assert snapshot.status is RunStatus.COMPLETED_WITH_ERRORS
+    assert snapshot.result.detail["partial_success"] is True
     assert [call["tweet_id"] for call in replier.calls] == ["tweet-2"]
     assert any(
         event.message == "candidate failed after retries" and event.payload["tweet_id"] == "tweet-1"
         for event in snapshot.events
     )
+
+
+def test_author_alpha_reports_partial_success_when_one_target_cannot_be_replied_to(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "author_1", author_score=100, impressions_total_7d=100)
+    _upsert_author(storage, "author_2", author_score=90, impressions_total_7d=90)
+
+    class PartialFailureReplyClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
+            self.calls.append({"tweet_id": tweet_id, "text": text})
+            if tweet_id == "tweet-2":
+                return TwitterCommandResult(
+                    action="reply",
+                    ok=False,
+                    target_tweet_id=tweet_id,
+                    error_message="Twitter API returned errors: Authorization: The original Tweet author restricted who can reply to this Tweet. (433)",
+                )
+            return TwitterCommandResult(
+                action="reply",
+                ok=True,
+                target_tweet_id=tweet_id,
+                tweet_id=f"reply-{len(self.calls)}",
+                text=text,
+            )
+
+    replier = PartialFailureReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=2, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [
+                _feed_post("tweet-1", "author_1"),
+                _feed_post("tweet-2", "author_2"),
+            ]
+        ),
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert snapshot.status is RunStatus.COMPLETED_WITH_ERRORS
+    assert snapshot.result.ok is True
+    assert snapshot.result.detail["partial_success"] is True
+    assert snapshot.result.detail["attempted_target_count"] == 2
+    assert snapshot.result.detail["successful_target_count"] == 1
+    assert snapshot.result.detail["failed_target_count"] == 1
+    assert snapshot.result.detail["target_failure_rate"] == 0.5
+    assert snapshot.result.detail["skipped_targets"] == [
+        {
+            "tweet_id": "tweet-2",
+            "screen_name": "author_2",
+            "reason": "Twitter API returned errors: Authorization: The original Tweet author restricted who can reply to this Tweet. (433)",
+        }
+    ]
 
 
 def test_author_alpha_does_not_retry_reply_writes(tmp_path: Path) -> None:
@@ -371,7 +471,8 @@ def test_author_alpha_does_not_retry_reply_writes(tmp_path: Path) -> None:
     snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
 
     assert snapshot.result is not None
-    assert snapshot.status.value == "completed"
+    assert snapshot.status is RunStatus.COMPLETED_WITH_ERRORS
+    assert snapshot.result.detail["partial_success"] is True
     assert [call["tweet_id"] for call in replier.calls] == ["tweet-1", "tweet-2"]
     assert not any(event.node == "retry" and event.payload["operation"] == "send reply" for event in snapshot.events)
 
@@ -396,10 +497,13 @@ def test_author_alpha_allows_already_replied_target_until_lifetime_cap_of_four(t
     graph = AuthorAlphaExecutionGraph(
         config=_config(per_run_same_target_burst_limit=3),
         storage=storage,
-        candidate_source=_FakeDeviceFollowFeedClient([_feed_post("tweet-1", "alpha_one")]),
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [_feed_post("tweet-1", "alpha_one", created_at="2026-04-27T00:20:00Z")]
+        ),
         drafter=_FakeDrafter(),
         reply_client=replier,
         sleep=_SleepRecorder(),
+        now=lambda: datetime(2026, 4, 27, 1, 20, tzinfo=UTC),
     )
 
     snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
@@ -432,7 +536,9 @@ def test_author_alpha_stops_burst_when_global_send_limit_15m_is_reached(tmp_path
     graph = AuthorAlphaExecutionGraph(
         config=_config(global_send_limit_15m=50, per_run_same_target_burst_limit=3),
         storage=storage,
-        candidate_source=_FakeDeviceFollowFeedClient([_feed_post("tweet-1", "alpha_one")]),
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [_feed_post("tweet-1", "alpha_one", created_at="2026-04-27T00:20:00Z")]
+        ),
         drafter=_FakeDrafter(),
         reply_client=replier,
         sleep=sleep,
@@ -471,8 +577,8 @@ def test_author_alpha_skips_author_when_per_author_daily_cap_is_reached(tmp_path
         storage=storage,
         candidate_source=_FakeDeviceFollowFeedClient(
             [
-                _feed_post("tweet-capped", "capped_author"),
-                _feed_post("tweet-open", "open_author"),
+                _feed_post("tweet-capped", "capped_author", created_at="2026-04-27T01:05:00Z"),
+                _feed_post("tweet-open", "open_author", created_at="2026-04-27T01:10:00Z"),
             ]
         ),
         drafter=_FakeDrafter(),
@@ -498,7 +604,9 @@ def test_author_alpha_stops_run_when_daily_execution_limit_is_reached(tmp_path: 
     graph = AuthorAlphaExecutionGraph(
         config=_config(daily_execution_limit=2, per_run_same_target_burst_limit=3),
         storage=storage,
-        candidate_source=_FakeDeviceFollowFeedClient([_feed_post("tweet-1", "alpha_one")]),
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [_feed_post("tweet-1", "alpha_one", created_at="2026-04-27T01:10:00Z")]
+        ),
         drafter=_FakeDrafter(),
         reply_client=replier,
         sleep=sleep,
@@ -537,7 +645,9 @@ def test_author_alpha_uses_configured_timezone_for_daily_author_cap(tmp_path: Pa
             per_run_same_target_burst_limit=1,
         ),
         storage=storage,
-        candidate_source=_FakeDeviceFollowFeedClient([_feed_post("tweet-1", "alpha_one")]),
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [_feed_post("tweet-1", "alpha_one", created_at="2026-04-26T16:15:00Z")]
+        ),
         drafter=_FakeDrafter(),
         reply_client=replier,
         sleep=_SleepRecorder(),
@@ -716,11 +826,13 @@ def _tweet(tweet_id: str, screen_name: str) -> TweetRecord:
     )
 
 
-def _feed_post(tweet_id: str, screen_name: str) -> dict[str, object]:
+def _feed_post(tweet_id: str, screen_name: str, *, created_at: str | None = None) -> dict[str, object]:
+    if created_at is None:
+        created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     return {
         "id": tweet_id,
         "text": f"post from {screen_name}",
-        "created_at": "2026-04-27T00:00:00Z",
+        "created_at": created_at,
         "url": f"https://x.com/{screen_name}/status/{tweet_id}",
         "author": {
             "screen_name": screen_name,
