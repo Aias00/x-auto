@@ -681,6 +681,122 @@ class AutomationStorage:
                 ),
             )
 
+    def list_shared_engagements(self, *, workflow: str | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT id, workflow, run_id, target_tweet_id, target_author, target_tweet_url, reply_tweet_id, reply_url, followed, created_at
+            FROM shared_engagements
+        """
+        parameters: tuple[Any, ...] = ()
+        if workflow is not None:
+            query += " WHERE workflow = ?"
+            parameters = (workflow,)
+        query += " ORDER BY created_at ASC, id ASC"
+        with self.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [dict(row) for row in rows]
+
+    def replace_shared_engagements(self, *, workflow: str, rows: list[dict[str, Any]]) -> int:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM shared_engagements WHERE workflow = ?", (workflow,))
+            for row in rows:
+                connection.execute(
+                    """
+                    INSERT INTO shared_engagements (
+                        workflow,
+                        run_id,
+                        target_tweet_id,
+                        target_author,
+                        target_tweet_url,
+                        reply_tweet_id,
+                        reply_url,
+                        followed,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workflow,
+                        row.get("run_id"),
+                        row.get("target_tweet_id"),
+                        row.get("target_author"),
+                        row.get("target_tweet_url"),
+                        row.get("reply_tweet_id"),
+                        row.get("reply_url"),
+                        int(bool(row.get("followed"))),
+                        row.get("created_at") or utcnow(),
+                    ),
+                )
+        return len(rows)
+
+    def import_shared_engagements(
+        self,
+        *,
+        workflow: str,
+        rows: list[dict[str, Any]],
+        replace_existing: bool = False,
+    ) -> int:
+        imported_count = 0
+        with self.connect() as connection:
+            if replace_existing:
+                connection.execute("DELETE FROM shared_engagements WHERE workflow = ?", (workflow,))
+            for row in rows:
+                run_id = str(row.get("run_id") or "").strip()
+                target_tweet_id = row.get("target_tweet_id")
+                reply_tweet_id = row.get("reply_tweet_id")
+                created_at = row.get("created_at") or utcnow()
+                if not run_id:
+                    raise ValueError("shared_engagements entry must include run_id")
+                if not replace_existing:
+                    existing = connection.execute(
+                        """
+                        SELECT 1
+                        FROM shared_engagements
+                        WHERE workflow = ?
+                          AND run_id = ?
+                          AND ifnull(target_tweet_id, '') = ifnull(?, '')
+                          AND ifnull(reply_tweet_id, '') = ifnull(?, '')
+                          AND created_at = ?
+                        LIMIT 1
+                        """,
+                        (workflow, run_id, target_tweet_id, reply_tweet_id, created_at),
+                    ).fetchone()
+                    if existing is not None:
+                        continue
+                connection.execute(
+                    """
+                    INSERT INTO shared_engagements (
+                        workflow,
+                        run_id,
+                        target_tweet_id,
+                        target_author,
+                        target_tweet_url,
+                        reply_tweet_id,
+                        reply_url,
+                        followed,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workflow,
+                        run_id,
+                        target_tweet_id,
+                        row.get("target_author"),
+                        row.get("target_tweet_url"),
+                        reply_tweet_id,
+                        row.get("reply_url"),
+                        int(bool(row.get("followed"))),
+                        created_at,
+                    ),
+                )
+                imported_count += 1
+        return imported_count
+
+    def delete_shared_engagements(self, *, workflow: str) -> int:
+        with self.connect() as connection:
+            cursor = connection.execute("DELETE FROM shared_engagements WHERE workflow = ?", (workflow,))
+        return int(cursor.rowcount or 0)
+
     def has_target_tweet_id(self, target_tweet_id: str, *, exclude_workflows: tuple[str, ...] | None = None) -> bool:
         query = """
                 SELECT target_tweet_id

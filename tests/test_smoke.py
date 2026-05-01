@@ -2027,6 +2027,293 @@ def test_author_alpha_manual_execute_route_runs_once_without_scheduler(tmp_path:
     assert payload["status"] in {"completed", "failed", "skipped"}
 
 
+def test_author_alpha_score_export_import_routes_round_trip(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    base_db_path = tmp_path / "base.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(base_db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    storage = AuthorAlphaStorage(db_path)
+    storage.initialize()
+    base_storage = AutomationStorage(base_db_path)
+    base_storage.initialize()
+    storage.upsert_author(
+        screen_name="alpha_one",
+        author_name="Alpha One",
+        rest_id="rest-alpha-one",
+        author_score=321.0,
+        reply_count_7d=9,
+        impressions_total_7d=999,
+        avg_impressions_7d=111.0,
+        max_impressions_7d=222,
+        last_replied_at="2026-04-27T00:00:00+00:00",
+        last_post_seen_at="2026-04-27T00:10:00+00:00",
+        last_scored_at="2026-04-27T00:20:00+00:00",
+        source="test",
+    )
+    storage.upsert_reply_daily_metrics(
+        metric_date="2026-04-27",
+        reply_tweet_id="reply-1",
+        target_tweet_id="tweet-1",
+        target_author="alpha_one",
+        impressions=222,
+        likes=10,
+        replies=1,
+        reposts=0,
+        sampled_at="2026-04-27T00:30:00+00:00",
+    )
+    storage.upsert_author_daily_rollup(
+        metric_date="2026-04-27",
+        target_author="alpha_one",
+        reply_count=1,
+        impressions_total=222,
+        likes_total=10,
+        replies_total=1,
+        reposts_total=0,
+        avg_impressions=222.0,
+        max_impressions=222,
+        computed_at="2026-04-27T00:40:00+00:00",
+    )
+    storage.record_sync_run(
+        run_id="bootstrap-1",
+        run_type="bootstrap",
+        status="completed",
+        from_date="2026-04-20",
+        to_date="2026-04-27",
+        current_date="2026-04-27",
+        days_completed=8,
+        days_total=8,
+        resume_from_date=None,
+        created_at="2026-04-27T00:45:00+00:00",
+        started_at="2026-04-27T00:45:00+00:00",
+        finished_at="2026-04-27T00:50:00+00:00",
+    )
+    storage.write_checkpoint(
+        sync_scope="bootstrap",
+        last_completed_date="2026-04-27",
+        next_pending_date=None,
+        last_run_id="bootstrap-1",
+        updated_at="2026-04-27T00:51:00+00:00",
+    )
+    storage.record_engagement(
+        run_id="alpha-run-1",
+        target_author="alpha_one",
+        target_tweet_id="tweet-1",
+        target_tweet_url="https://x.com/alpha_one/status/tweet-1",
+        reply_tweet_id="reply-alpha-1",
+        reply_url="https://x.com/i/status/reply-alpha-1",
+        created_at="2026-04-27T01:00:00+00:00",
+    )
+    storage.create_execution_run(
+        run_id="alpha-run-1",
+        job_id="manual-author-alpha-engage",
+        job_type="author_alpha_engage",
+        endpoint="manual:author-alpha-engage",
+        request_payload={"dry_run": False},
+        status="completed",
+    )
+    storage.add_execution_audit_event(
+        run_id="alpha-run-1",
+        event_type="reply_sent",
+        node="execute_burst",
+        payload={"tweet_id": "tweet-1"},
+    )
+    storage.update_execution_run(
+        "alpha-run-1",
+        status="completed",
+        response_payload={"status": "completed"},
+        started_at="2026-04-27T01:00:00+00:00",
+        finished_at="2026-04-27T01:05:00+00:00",
+    )
+
+    with TestClient(app) as client:
+        export_response = client.get("/author-alpha/scores/export")
+        assert export_response.status_code == 200
+        snapshot = export_response.json()
+        assert snapshot["author_count"] == 1
+        assert snapshot["reply_metric_count"] == 1
+        assert snapshot["rollup_count"] == 1
+        assert snapshot["sync_run_count"] == 1
+        assert snapshot["sync_checkpoint_count"] == 1
+        assert snapshot["engagement_count"] == 1
+        assert snapshot["execution_run_count"] == 1
+        assert snapshot["execution_audit_event_count"] == 1
+        assert snapshot["shared_engagement_count"] == 1
+        assert snapshot["authors"][0]["screen_name"] == "alpha_one"
+
+        reset_response = client.post("/author-alpha/reset")
+        assert reset_response.status_code == 200
+
+        import_response = client.post("/author-alpha/scores/import", json=snapshot)
+        assert import_response.status_code == 200
+        assert import_response.json()["imported_count"] == 1
+        assert import_response.json()["imported_reply_metric_count"] == 1
+        assert import_response.json()["imported_rollup_count"] == 1
+        assert import_response.json()["imported_sync_run_count"] == 1
+        assert import_response.json()["imported_sync_checkpoint_count"] == 1
+        assert import_response.json()["imported_engagement_count"] == 1
+        assert import_response.json()["imported_execution_run_count"] == 1
+        assert import_response.json()["imported_execution_audit_event_count"] == 1
+        assert import_response.json()["imported_shared_engagement_count"] == 1
+
+    restored = storage.list_authors_ordered_by_score()
+    assert [author["screen_name"] for author in restored] == ["alpha_one"]
+    assert storage.get_reply_daily_metric("2026-04-27", "reply-1") is not None
+    assert storage.get_author_daily_rollup("2026-04-27", "alpha_one") is not None
+    assert storage.get_sync_run("bootstrap-1") is not None
+    assert storage.read_checkpoint("bootstrap") is not None
+    assert storage.get_target_success_count("tweet-1") == 1
+    execution_payload = storage.get_execution_run("alpha-run-1")
+    assert execution_payload is not None
+    assert execution_payload["audit_events"][0]["event_type"] == "reply_sent"
+
+
+def test_author_alpha_score_import_route_merges_by_default(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    base_db_path = tmp_path / "base.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(base_db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    local_storage = AuthorAlphaStorage(db_path)
+    local_storage.initialize()
+    local_storage.upsert_author(
+        screen_name="local_author",
+        author_name="Local Author",
+        rest_id="rest-local",
+        author_score=10.0,
+        reply_count_7d=1,
+        impressions_total_7d=10,
+        avg_impressions_7d=10.0,
+        max_impressions_7d=10,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T00:00:00+00:00",
+        last_scored_at="2026-04-27T00:00:00+00:00",
+        source="local",
+    )
+
+    source_storage = AuthorAlphaStorage(tmp_path / "source.sqlite3")
+    source_storage.initialize()
+    source_storage.upsert_author(
+        screen_name="imported_author",
+        author_name="Imported Author",
+        rest_id="rest-imported",
+        author_score=99.0,
+        reply_count_7d=2,
+        impressions_total_7d=200,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=150,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T01:00:00+00:00",
+        last_scored_at="2026-04-27T01:10:00+00:00",
+        source="import",
+    )
+    snapshot = source_storage.export_score_snapshot()
+
+    with TestClient(app) as client:
+        response = client.post("/author-alpha/scores/import", json=snapshot)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["replace_existing"] is False
+    assert {author["screen_name"] for author in local_storage.list_authors_ordered_by_score()} == {
+        "local_author",
+        "imported_author",
+    }
+
+
+def test_author_alpha_score_import_rolls_back_local_changes_when_shared_import_fails(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    base_db_path = tmp_path / "base.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(base_db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    local_storage = AuthorAlphaStorage(db_path)
+    local_storage.initialize()
+    local_storage.upsert_author(
+        screen_name="local_author",
+        author_name="Local Author",
+        rest_id="rest-local",
+        author_score=10.0,
+        reply_count_7d=1,
+        impressions_total_7d=10,
+        avg_impressions_7d=10.0,
+        max_impressions_7d=10,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T00:00:00+00:00",
+        last_scored_at="2026-04-27T00:00:00+00:00",
+        source="local",
+    )
+    source_storage = AuthorAlphaStorage(tmp_path / "source.sqlite3")
+    source_storage.initialize()
+    source_storage.upsert_author(
+        screen_name="imported_author",
+        author_name="Imported Author",
+        rest_id="rest-imported",
+        author_score=99.0,
+        reply_count_7d=2,
+        impressions_total_7d=200,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=150,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T01:00:00+00:00",
+        last_scored_at="2026-04-27T01:10:00+00:00",
+        source="import",
+    )
+    snapshot = source_storage.export_score_snapshot()
+
+    def boom(*args, **kwargs):
+        raise ValueError("shared import failed")
+
+    monkeypatch.setattr(automation_api, "_backfill_author_alpha_shared_engagements", lambda **kwargs: 0)
+    monkeypatch.setattr(automation_api.AutomationStorage, "import_shared_engagements", boom)
+
+    with TestClient(app) as client:
+        response = client.post("/author-alpha/scores/import", json=snapshot)
+
+    assert response.status_code == 400
+    assert [author["screen_name"] for author in local_storage.list_authors_ordered_by_score()] == ["local_author"]
+
+
+def test_author_alpha_export_backfills_shared_engagements_from_historical_lane_engagements(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "author-alpha.sqlite3"
+    base_db_path = tmp_path / "base.sqlite3"
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(db_path))
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(base_db_path))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "false")
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+
+    storage = AuthorAlphaStorage(db_path)
+    storage.initialize()
+    storage.record_engagement(
+        run_id="alpha-run-legacy",
+        target_author="alpha_one",
+        target_tweet_id="tweet-legacy",
+        target_tweet_url="https://x.com/alpha_one/status/tweet-legacy",
+        reply_tweet_id="reply-legacy",
+        reply_url="https://x.com/i/status/reply-legacy",
+        created_at="2026-04-27T01:00:00+00:00",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/author-alpha/scores/export")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["engagement_count"] == 1
+    assert payload["shared_engagement_count"] == 1
+    assert payload["shared_engagements"][0]["target_tweet_id"] == "tweet-legacy"
+
+
 def test_feed_engage_manual_execute_route_runs_once_without_scheduler(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "manual-feed.sqlite3"
     monkeypatch.setenv("X_ATUO_DB_PATH", str(db_path))

@@ -260,6 +260,328 @@ def test_author_alpha_storage_counts_target_and_author_successes(tmp_path: Path)
     assert tuple(row) == ("burst-1", 2, 3)
 
 
+def test_author_alpha_storage_exports_and_imports_score_snapshot(tmp_path: Path) -> None:
+    source = AuthorAlphaStorage(tmp_path / "source.sqlite3")
+    target = AuthorAlphaStorage(tmp_path / "target.sqlite3")
+    source.initialize()
+    target.initialize()
+
+    source.upsert_author(
+        screen_name="alice",
+        author_name="Alice",
+        rest_id="rest-alice",
+        author_score=123.4,
+        reply_count_7d=5,
+        impressions_total_7d=500,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=180,
+        last_replied_at="2026-04-27T01:00:00+00:00",
+        last_post_seen_at="2026-04-27T02:00:00+00:00",
+        last_scored_at="2026-04-27T03:00:00+00:00",
+        source="sync",
+    )
+    source.upsert_author(
+        screen_name="bob",
+        author_name="Bob",
+        rest_id="rest-bob",
+        author_score=99.9,
+        reply_count_7d=4,
+        impressions_total_7d=320,
+        avg_impressions_7d=80.0,
+        max_impressions_7d=150,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T04:00:00+00:00",
+        last_scored_at="2026-04-27T05:00:00+00:00",
+        source="sync",
+    )
+    source.upsert_reply_daily_metrics(
+        metric_date="2026-04-27",
+        reply_tweet_id="reply-1",
+        target_tweet_id="tweet-1",
+        target_author="alice",
+        impressions=120,
+        likes=11,
+        replies=2,
+        reposts=1,
+        sampled_at="2026-04-27T06:00:00+00:00",
+    )
+    source.upsert_author_daily_rollup(
+        metric_date="2026-04-27",
+        target_author="alice",
+        reply_count=1,
+        impressions_total=120,
+        likes_total=11,
+        replies_total=2,
+        reposts_total=1,
+        avg_impressions=120.0,
+        max_impressions=120,
+        computed_at="2026-04-27T06:30:00+00:00",
+    )
+    source.record_sync_run(
+        run_id="sync-1",
+        run_type="bootstrap",
+        status="completed",
+        from_date="2026-04-20",
+        to_date="2026-04-27",
+        current_date="2026-04-27",
+        days_completed=8,
+        days_total=8,
+        resume_from_date=None,
+        created_at="2026-04-27T07:00:00+00:00",
+        started_at="2026-04-27T07:00:00+00:00",
+        finished_at="2026-04-27T07:30:00+00:00",
+    )
+    source.write_checkpoint(
+        sync_scope="bootstrap",
+        last_completed_date="2026-04-27",
+        next_pending_date=None,
+        last_run_id="sync-1",
+        updated_at="2026-04-27T07:31:00+00:00",
+    )
+    source.record_engagement(
+        run_id="alpha-run-1",
+        target_author="alice",
+        target_tweet_id="tweet-1",
+        target_tweet_url="https://x.com/alice/status/tweet-1",
+        reply_tweet_id="reply-alpha-1",
+        reply_url="https://x.com/i/status/reply-alpha-1",
+        burst_id="burst-1",
+        burst_index=1,
+        burst_size=1,
+        created_at="2026-04-27T08:00:00+00:00",
+    )
+    source.create_execution_run(
+        run_id="alpha-run-1",
+        job_id="manual-author-alpha-engage",
+        job_type="author_alpha_engage",
+        endpoint="manual:author-alpha-engage",
+        request_payload={"dry_run": False},
+        status="completed",
+    )
+    source.update_execution_run(
+        "alpha-run-1",
+        status="completed",
+        response_payload={"status": "completed"},
+        started_at="2026-04-27T08:00:00+00:00",
+        finished_at="2026-04-27T08:05:00+00:00",
+    )
+    source.add_execution_audit_event(
+        run_id="alpha-run-1",
+        event_type="reply_sent",
+        node="execute_burst",
+        payload={"tweet_id": "tweet-1"},
+    )
+    target.upsert_author(
+        screen_name="stale",
+        author_name="Stale",
+        rest_id="rest-stale",
+        author_score=1.0,
+        reply_count_7d=1,
+        impressions_total_7d=1,
+        avg_impressions_7d=1.0,
+        max_impressions_7d=1,
+        last_replied_at=None,
+        last_post_seen_at=None,
+        last_scored_at=None,
+        source="old",
+    )
+
+    snapshot = source.export_score_snapshot()
+    result = target.import_score_snapshot(snapshot, replace_existing=True)
+
+    assert result["status"] == "imported"
+    assert result["imported_count"] == 2
+    assert result["imported_reply_metric_count"] == 1
+    assert result["imported_rollup_count"] == 1
+    assert result["imported_sync_run_count"] == 1
+    assert result["imported_sync_checkpoint_count"] == 1
+    assert result["imported_engagement_count"] == 1
+    assert result["imported_execution_run_count"] == 1
+    assert result["imported_execution_audit_event_count"] == 1
+    assert snapshot["reply_metric_count"] == 1
+    assert snapshot["rollup_count"] == 1
+    assert snapshot["sync_run_count"] == 1
+    assert snapshot["sync_checkpoint_count"] == 1
+    assert snapshot["engagement_count"] == 1
+    assert snapshot["execution_run_count"] == 1
+    assert snapshot["execution_audit_event_count"] == 1
+    assert [author["screen_name"] for author in target.list_authors_ordered_by_score()] == ["alice", "bob"]
+    assert target.get_reply_daily_metric("2026-04-27", "reply-1") is not None
+    assert target.get_author_daily_rollup("2026-04-27", "alice") is not None
+    assert target.get_sync_run("sync-1") is not None
+    assert target.read_checkpoint("bootstrap") is not None
+    assert target.get_target_success_count("tweet-1") == 1
+    execution_payload = target.get_execution_run("alpha-run-1")
+    assert execution_payload is not None
+    assert execution_payload["audit_events"][0]["event_type"] == "reply_sent"
+
+
+def test_author_alpha_storage_import_snapshot_can_merge_without_overwriting_existing_state(tmp_path: Path) -> None:
+    source = AuthorAlphaStorage(tmp_path / "source.sqlite3")
+    target = AuthorAlphaStorage(tmp_path / "target.sqlite3")
+    source.initialize()
+    target.initialize()
+
+    source.upsert_author(
+        screen_name="imported_author",
+        author_name="Imported Author",
+        rest_id="rest-imported",
+        author_score=88.0,
+        reply_count_7d=2,
+        impressions_total_7d=200,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=120,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T02:00:00+00:00",
+        last_scored_at="2026-04-27T03:00:00+00:00",
+        source="import",
+    )
+    source.upsert_author(
+        screen_name="local_author",
+        author_name="Imported Local Author",
+        rest_id="rest-local-import",
+        author_score=999.0,
+        reply_count_7d=20,
+        impressions_total_7d=2000,
+        avg_impressions_7d=100.0,
+        max_impressions_7d=500,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T05:00:00+00:00",
+        last_scored_at="2026-04-27T05:30:00+00:00",
+        source="import",
+    )
+    source.record_sync_run(
+        run_id="sync-imported",
+        run_type="reconcile",
+        status="completed",
+        from_date=None,
+        to_date=None,
+        current_date="2026-04-27",
+        days_completed=1,
+        days_total=1,
+        resume_from_date=None,
+        created_at="2026-04-27T03:10:00+00:00",
+        started_at="2026-04-27T03:10:00+00:00",
+        finished_at="2026-04-27T03:11:00+00:00",
+    )
+    source.record_sync_run(
+        run_id="sync-local",
+        run_type="bootstrap",
+        status="failed",
+        from_date="2026-04-01",
+        to_date="2026-04-10",
+        current_date="2026-04-03",
+        days_completed=2,
+        days_total=10,
+        resume_from_date="2026-04-04",
+        created_at="2026-04-27T03:20:00+00:00",
+        started_at="2026-04-27T03:20:00+00:00",
+        finished_at="2026-04-27T03:21:00+00:00",
+    )
+    source.write_checkpoint(
+        sync_scope="bootstrap",
+        last_completed_date="2026-04-10",
+        next_pending_date=None,
+        last_run_id="sync-local",
+        updated_at="2026-04-27T03:22:00+00:00",
+    )
+    source.upsert_reply_daily_metrics(
+        metric_date="2026-04-27",
+        reply_tweet_id="reply-shared",
+        target_tweet_id="tweet-shared",
+        target_author="local_author",
+        impressions=500,
+        likes=50,
+        replies=5,
+        reposts=2,
+        sampled_at="2026-04-27T03:23:00+00:00",
+    )
+    source.upsert_author_daily_rollup(
+        metric_date="2026-04-27",
+        target_author="local_author",
+        reply_count=5,
+        impressions_total=500,
+        likes_total=50,
+        replies_total=5,
+        reposts_total=2,
+        avg_impressions=100.0,
+        max_impressions=200,
+        computed_at="2026-04-27T03:24:00+00:00",
+    )
+
+    target.upsert_author(
+        screen_name="local_author",
+        author_name="Local Author",
+        rest_id="rest-local",
+        author_score=77.0,
+        reply_count_7d=3,
+        impressions_total_7d=150,
+        avg_impressions_7d=50.0,
+        max_impressions_7d=75,
+        last_replied_at=None,
+        last_post_seen_at="2026-04-27T01:00:00+00:00",
+        last_scored_at="2026-04-27T01:30:00+00:00",
+        source="local",
+    )
+    target.record_sync_run(
+        run_id="sync-local",
+        run_type="bootstrap",
+        status="completed",
+        from_date="2026-04-20",
+        to_date="2026-04-26",
+        current_date="2026-04-26",
+        days_completed=7,
+        days_total=7,
+        resume_from_date=None,
+        created_at="2026-04-27T01:40:00+00:00",
+        started_at="2026-04-27T01:40:00+00:00",
+        finished_at="2026-04-27T01:50:00+00:00",
+    )
+    target.write_checkpoint(
+        sync_scope="bootstrap",
+        last_completed_date="2026-04-26",
+        next_pending_date="2026-04-27",
+        last_run_id="sync-local",
+        updated_at="2026-04-27T01:51:00+00:00",
+    )
+    target.upsert_reply_daily_metrics(
+        metric_date="2026-04-27",
+        reply_tweet_id="reply-shared",
+        target_tweet_id="tweet-local",
+        target_author="local_author",
+        impressions=10,
+        likes=1,
+        replies=0,
+        reposts=0,
+        sampled_at="2026-04-27T01:52:00+00:00",
+    )
+    target.upsert_author_daily_rollup(
+        metric_date="2026-04-27",
+        target_author="local_author",
+        reply_count=1,
+        impressions_total=10,
+        likes_total=1,
+        replies_total=0,
+        reposts_total=0,
+        avg_impressions=10.0,
+        max_impressions=10,
+        computed_at="2026-04-27T01:53:00+00:00",
+    )
+
+    snapshot = source.export_score_snapshot()
+    result = target.import_score_snapshot(snapshot, replace_existing=False)
+
+    assert result["replace_existing"] is False
+    assert [author["screen_name"] for author in target.list_authors_ordered_by_score()] == ["imported_author", "local_author"]
+    assert {row["run_id"] for row in target.list_sync_runs(limit=10)} == {"sync-imported", "sync-local"}
+    local_author = next(author for author in target.list_authors_ordered_by_score() if author["screen_name"] == "local_author")
+    assert local_author["author_score"] == pytest.approx(77.0)
+    assert target.get_sync_run("sync-local")["status"] == "completed"
+    assert target.read_checkpoint("bootstrap")["last_completed_date"] == "2026-04-26"
+    assert target.get_reply_daily_metric("2026-04-27", "reply-shared")["target_tweet_id"] == "tweet-local"
+    assert target.get_author_daily_rollup("2026-04-27", "local_author")["impressions_total"] == 10
+
+
 def test_author_alpha_storage_counts_recent_successes_inclusively_across_offsets(tmp_path: Path) -> None:
     storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
     storage.initialize()

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from importlib import import_module
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from types import ModuleType
 from typing import Any
 from uuid import uuid4
@@ -30,6 +31,8 @@ from x_atuo.automation.schemas import (
     AuthorAlphaExecuteResponse,
     AuthorAlphaResetResponse,
     AuthorAlphaReconcileRequest,
+    AuthorAlphaScoreImportResponse,
+    AuthorAlphaScoreSnapshotResponse,
     AuthorAlphaRunLookupResponse,
     AuthorAlphaSyncAcceptedResponse,
     AuthorAlphaSyncHistoryResponse,
@@ -79,6 +82,63 @@ def _resolve_db_path() -> Path:
 
 def _resolve_author_alpha_db_path(settings: AutomationConfig) -> Path:
     return Path(settings.author_alpha.db_path).expanduser()
+
+
+def _author_alpha_shared_rows(storage: AuthorAlphaStorage) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in storage.list_engagements():
+        rows.append(
+            {
+                "run_id": row.get("run_id"),
+                "target_tweet_id": row.get("target_tweet_id"),
+                "target_author": row.get("target_author"),
+                "target_tweet_url": row.get("target_tweet_url"),
+                "reply_tweet_id": row.get("reply_tweet_id"),
+                "reply_url": row.get("reply_url"),
+                "followed": False,
+                "created_at": row.get("created_at"),
+            }
+        )
+    return rows
+
+
+def _backfill_author_alpha_shared_engagements(
+    *,
+    author_alpha_storage: AuthorAlphaStorage,
+    storage: AutomationStorage,
+) -> int:
+    importer = getattr(storage, "import_shared_engagements", None)
+    engagement_reader = getattr(author_alpha_storage, "list_engagements", None)
+    if not callable(importer) or not callable(engagement_reader):
+        return 0
+    return storage.import_shared_engagements(
+        workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE.value,
+        rows=_author_alpha_shared_rows(author_alpha_storage),
+        replace_existing=False,
+    )
+
+
+def _snapshot_db_file(path: Path) -> tuple[bool, bytes | None]:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        return False, None
+    return True, resolved.read_bytes()
+
+
+def _restore_db_file(path: Path, snapshot: tuple[bool, bytes | None]) -> None:
+    existed, payload = snapshot
+    resolved = path.expanduser().resolve()
+    if existed:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        if payload is None:
+            raise RuntimeError("database snapshot payload missing for existing file")
+        with NamedTemporaryFile(dir=resolved.parent, delete=False) as handle:
+            handle.write(payload)
+            temp_path = Path(handle.name)
+        temp_path.replace(resolved)
+    else:
+        if resolved.exists():
+            resolved.unlink()
 
 
 class _LazyAuthorAlphaSyncManager:
@@ -554,6 +614,7 @@ async def lifespan(app: FastAPI):
     storage.initialize()
     author_alpha_storage.initialize()
     storage.clear_stale_running_runs(reason="stale running cleared on service startup")
+    _backfill_author_alpha_shared_engagements(author_alpha_storage=author_alpha_storage, storage=storage)
     app.state.storage = storage
     app.state.author_alpha_storage = author_alpha_storage
     app.state.settings = settings
@@ -1232,12 +1293,61 @@ async def get_author_alpha_run(run_id: str, request: Request) -> AuthorAlphaRunL
     return AuthorAlphaRunLookupResponse(run=sync_payload, audit_events=[])
 
 
+@app.get("/author-alpha/scores/export", response_model=AuthorAlphaScoreSnapshotResponse)
+async def get_author_alpha_scores_export(request: Request) -> AuthorAlphaScoreSnapshotResponse:
+    author_alpha_storage = get_author_alpha_storage(request)
+    storage = get_storage(request)
+    _backfill_author_alpha_shared_engagements(author_alpha_storage=author_alpha_storage, storage=storage)
+    payload = author_alpha_storage.export_score_snapshot()
+    shared_engagements = storage.list_shared_engagements(workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE.value)
+    payload["shared_engagement_count"] = len(shared_engagements)
+    payload["shared_engagements"] = shared_engagements
+    return AuthorAlphaScoreSnapshotResponse(**payload)
+
+
+@app.post("/author-alpha/scores/import", response_model=AuthorAlphaScoreImportResponse)
+async def post_author_alpha_scores_import(
+    request: Request,
+    body: AuthorAlphaScoreSnapshotResponse,
+    replace_existing: bool = Query(default=False),
+) -> AuthorAlphaScoreImportResponse:
+    author_alpha_storage = get_author_alpha_storage(request)
+    storage = get_storage(request)
+    author_alpha_snapshot = _snapshot_db_file(author_alpha_storage.db_path)
+    shared_snapshot = _snapshot_db_file(storage.db_path)
+    try:
+        raw_payload = body.model_dump(mode="python")
+        shared_engagements = raw_payload.pop("shared_engagements", [])
+        payload = author_alpha_storage.import_score_snapshot(
+            raw_payload,
+            replace_existing=replace_existing,
+        )
+        imported_shared_engagement_count = storage.import_shared_engagements(
+            workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE.value,
+            rows=shared_engagements,
+            replace_existing=replace_existing,
+        )
+        imported_shared_engagement_count += _backfill_author_alpha_shared_engagements(
+            author_alpha_storage=author_alpha_storage,
+            storage=storage,
+        )
+        payload["imported_shared_engagement_count"] = imported_shared_engagement_count
+    except Exception as exc:
+        _restore_db_file(author_alpha_storage.db_path, author_alpha_snapshot)
+        _restore_db_file(storage.db_path, shared_snapshot)
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+        raise
+    return AuthorAlphaScoreImportResponse(**payload)
+
+
 @app.post("/author-alpha/reset", response_model=AuthorAlphaResetResponse)
 async def post_author_alpha_reset(request: Request) -> AuthorAlphaResetResponse:
     manager = get_author_alpha_sync_manager(request)
     if manager.get_status().get("active"):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="author-alpha sync run already active")
     get_author_alpha_storage(request).reset_all()
+    get_storage(request).delete_shared_engagements(workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE.value)
     return AuthorAlphaResetResponse(status="cleared")
 
 

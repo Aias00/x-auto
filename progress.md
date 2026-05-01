@@ -44,6 +44,12 @@
 - Verified the new manual feed-engage route with one real execution: run `34e585ef-2082-4c5f-92bb-57992b35e36e` replied to `@sama` on tweet `2049493609028923826` with reply tweet `2049496352460337467`.
 - Cleaned the final migration/documentation residue: `TwitterClient` write methods are now guarded against duplicate definitions by regression tests, README reflects both manual execute routes and current author-alpha pacing, and this progress file no longer describes a vendored compatibility layer that has already been removed.
 - Added a shared cross-workflow engagement ledger in the main automation DB so `feed-engage` and `author-alpha` now record touched target tweets into the same table; `author-alpha` still keeps `alpha_engagements` for burst/lifetime caps, but it now skips targets that were already touched by other workflows and mirrors its successful replies into the shared ledger.
+- Added portable author-alpha continuation bundle export/import: the current `alpha_authors` scoring results, recompute inputs (`alpha_reply_daily_metrics`, `alpha_author_daily_rollups`), sync history/checkpoints, execution history/audit trail, lane-local engagements, and author-alpha shared-engagement ledger rows can now be exported as a versioned JSON bundle and imported elsewhere through the matching API, including replace-existing restore semantics for whole-snapshot moves.
+- Author-alpha bundle import now defaults to merge semantics (`replace_existing=false`) so local score/sync/execution state is preserved by default; explicit replace remains available for full-state restores.
+- Hardened author-alpha continuation import/export semantics:
+  - merge mode is now local-first for keyed state instead of overwrite-on-key
+  - API import now snapshots and restores both SQLite files on failure so partial cross-DB restores roll back cleanly
+  - startup/export now backfill historical `alpha_engagements` into the shared cross-workflow ledger so migrated bundles preserve old author-alpha touch history for cross-workflow dedupe
 
 ## Verification
 
@@ -107,7 +113,14 @@
 - `python3 -m compileall src tests` -> success
 - `uv run pytest -q tests/test_author_alpha_execution.py -k "shared_engagement or already_triggered_by_feed_engage"` -> `2 passed`
 - `uv run pytest -q tests/test_smoke.py -k "run_author_alpha_request_passes_real_asyncio_sleep or author_alpha_manual_execute_route_runs_once_without_scheduler or scheduler_dispatch_creates_author_alpha_execution_run"` -> `3 passed`
+- `uv run pytest -q tests/test_author_alpha_storage.py -k exports_and_imports_score_snapshot` -> `1 passed`
+- `uv run pytest -q tests/test_smoke.py -k score_export_import_routes_round_trip` -> `1 passed`
 - `uv run pytest -q` -> `187 passed`
+- `python3 -m compileall src tests` -> success
+- `uv run pytest -q tests/test_author_alpha_storage.py -k "merge_without_overwriting_existing_state or exports_and_imports_score_snapshot"` -> `2 passed`
+- `uv run pytest -q tests/test_smoke.py -k "score_import_rolls_back_local_changes_when_shared_import_fails or export_backfills_shared_engagements_from_historical_lane_engagements or score_export_import_routes_round_trip"` -> `3 passed`
+- `uv run pytest -q tests/test_langfuse_observability.py -k lifespan` -> `2 passed`
+- `uv run pytest -q` -> `205 passed`
 - `python3 -m compileall src tests` -> success
 
 ## Remaining Risks
@@ -120,6 +133,8 @@
 - Author-alpha original-target recovery depends on X detail payloads continuing to expose either the conversation root tweet author or the direct parent author.
 - Author-alpha burst drafting currently reuses the generic AI draft interface with burst context rather than a dedicated burst-plan model surface; the lane behavior is correct and tested, but the planning semantics remain thinner than the full design aspiration.
 - The shared engagement ledger currently dedupes at the target-tweet level across workflows; if future requirements need cross-workflow coexistence on the same target, the shared ledger policy will need to become workflow-aware rather than binary.
+- The author-alpha bundle now moves score state, recompute inputs, and continuation history, but it still does not migrate the main workflow DB’s non-author-alpha runs or non-author-alpha shared engagement rows.
+- Bundle merge mode now preserves local keyed state by default, but it does not currently reconcile divergent versions of the same record; it simply prefers local and skips the incoming row.
 - If deeper historical context is needed, use the archive below.
 
 ## Archive
@@ -144,7 +159,7 @@
 
 Main achievements:
 - The service no longer depends on the external `twitter` executable or the external `/Users/aias/Work/github/twitter-cli` repo at runtime.
-- Current runtime behavior is covered by `187` passing tests.
+- Current runtime behavior is covered by `205` passing tests.
 - Local service has been restarted successfully on the final code.
 
 Future recommendations:

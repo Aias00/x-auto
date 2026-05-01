@@ -32,6 +32,8 @@ Twitter automation service for scheduler-driven reply workflows, with independen
 - `GET /author-alpha/sync/status`
 - `GET /author-alpha/sync/history`
 - `GET /author-alpha/runs/{run_id}`
+- `GET /author-alpha/scores/export`
+- `POST /author-alpha/scores/import`
 - `POST /author-alpha/reset`
 - `POST /author-alpha/execute`
 
@@ -81,7 +83,11 @@ Twitter automation service for scheduler-driven reply workflows, with independen
   - `POST /author-alpha/sync/stop` requests cooperative cancellation of the currently active bootstrap/reconcile run
   - `GET /author-alpha/sync/status` reports active/latest sync state and checkpoints
   - `GET /author-alpha/sync/history` lists recent sync runs
-  - `GET /author-alpha/runs/{run_id}` looks up author-alpha execution runs first, then sync runs
+- `GET /author-alpha/runs/{run_id}` looks up author-alpha execution runs first, then sync runs
+- `GET /author-alpha/scores/export` returns a portable author-alpha bundle containing `alpha_authors`, recompute inputs (`alpha_reply_daily_metrics`, `alpha_author_daily_rollups`), and continuation state (`alpha_sync_runs`, `alpha_sync_checkpoints`, `alpha_engagements`, `alpha_runs`, `alpha_run_audit_events`, and author-alpha shared-engagement ledger rows)
+- `POST /author-alpha/scores/import` accepts that same JSON bundle body and restores/upserts the exported score state, recompute inputs, and continuation history so the lane can resume with the same sync/execution context
+  - default import mode is merge (`replace_existing=false`)
+  - pass `replace_existing=true` to replace the current author-alpha continuation state with the incoming bundle
   - `POST /author-alpha/reset` clears author-alpha sync, score, engagement, and execution-run data when no sync is active
 - `POST /author-alpha/execute` runs one author-alpha execution immediately without scheduler registration and works even when `X_ATUO_SCHEDULER__ENABLED=false`
   - it reuses the same execution logic as the scheduled lane, so manual validation also exercises the real candidate fetch / draft / execute path
@@ -253,6 +259,28 @@ Inspect author-alpha sync status and run history:
 curl -s http://127.0.0.1:18000/author-alpha/sync/status | jq
 curl -s "http://127.0.0.1:18000/author-alpha/sync/history?limit=10" | jq
 curl -s http://127.0.0.1:18000/author-alpha/runs/<run_id> | jq
+```
+
+Export the current author-alpha recompute bundle:
+
+```bash
+curl -s http://127.0.0.1:18000/author-alpha/scores/export | tee /tmp/author-alpha-scores.json | jq
+```
+
+Import a previously exported author-alpha recompute bundle:
+
+```bash
+curl -s -X POST "http://127.0.0.1:18000/author-alpha/scores/import?replace_existing=true" \
+  -H 'content-type: application/json' \
+  -d @/tmp/author-alpha-scores.json | jq
+```
+
+Merge a previously exported author-alpha bundle into the current local state:
+
+```bash
+curl -s -X POST "http://127.0.0.1:18000/author-alpha/scores/import" \
+  -H 'content-type: application/json' \
+  -d @/tmp/author-alpha-scores.json | jq
 ```
 
 Clear all local author-alpha data:
