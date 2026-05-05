@@ -57,13 +57,13 @@ class AutomationScheduler:
                 "misfire_grace_time": settings.misfire_grace_time,
             },
         )
-        self._dispatch_queue: queue.Queue[AutomationRequest | None] = queue.Queue(maxsize=self._max_backlog)
-        self._worker_thread: threading.Thread | None = None
+        self._dispatch_queues: dict[str, queue.Queue[AutomationRequest | None]] = {}
+        self._worker_threads: dict[str, threading.Thread] = {}
+        self._worker_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the underlying scheduler if not already running."""
 
-        self._ensure_worker_started()
         if not self.scheduler.running:
             self.scheduler.start()
 
@@ -114,9 +114,10 @@ class AutomationScheduler:
         raise ValueError(f"unsupported trigger type: {trigger}")
 
     def _dispatch_job(self, request: AutomationRequest) -> None:
-        self._ensure_worker_started()
         try:
-            self._dispatch_queue.put_nowait(request)
+            lane_key = self._lane_key(request)
+            dispatch_queue = self._ensure_lane(lane_key)
+            dispatch_queue.put_nowait(request)
         except queue.Full:
             logger.warning("scheduler backlog full; dropping queued job", extra={"job_name": request.job_name})
             if self.on_queue_full is not None:
@@ -127,36 +128,57 @@ class AutomationScheduler:
                 except Exception:
                     logger.exception("scheduler queue-full handler failed", extra={"job_name": request.job_name})
 
-    def _ensure_worker_started(self) -> None:
-        if self._worker_thread is not None and self._worker_thread.is_alive():
-            return
-        self._worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="x-atuo-scheduler-worker",
-            daemon=True,
-        )
-        self._worker_thread.start()
+    def _lane_key(self, request: AutomationRequest) -> str:
+        return request.workflow.value
+
+    def _ensure_lane(self, lane_key: str) -> queue.Queue[AutomationRequest | None]:
+        with self._worker_lock:
+            dispatch_queue = self._dispatch_queues.get(lane_key)
+            if dispatch_queue is None:
+                dispatch_queue = queue.Queue(maxsize=self._max_backlog)
+                self._dispatch_queues[lane_key] = dispatch_queue
+
+            worker_thread = self._worker_threads.get(lane_key)
+            if worker_thread is None or not worker_thread.is_alive():
+                worker_thread = threading.Thread(
+                    target=self._worker_loop,
+                    args=(lane_key, dispatch_queue),
+                    name=f"x-atuo-scheduler-worker-{lane_key}",
+                    daemon=True,
+                )
+                self._worker_threads[lane_key] = worker_thread
+                worker_thread.start()
+            return dispatch_queue
 
     def _stop_worker(self, *, wait: bool) -> None:
-        thread = self._worker_thread
-        if thread is None:
-            return
-        if wait:
-            self._dispatch_queue.put(None)
-        else:
-            try:
-                self._dispatch_queue.put_nowait(None)
-            except queue.Full:
-                pass
-        thread.join(timeout=5.0 if wait else 0.1)
-        if not thread.is_alive():
-            self._worker_thread = None
+        with self._worker_lock:
+            lane_items = list(self._dispatch_queues.items())
+            worker_items = list(self._worker_threads.items())
 
-    def _worker_loop(self) -> None:
+        for lane_key, dispatch_queue in lane_items:
+            if wait:
+                dispatch_queue.put(None)
+            else:
+                try:
+                    dispatch_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+
+        for lane_key, worker_thread in worker_items:
+            worker_thread.join(timeout=5.0 if wait else 0.1)
+            if not worker_thread.is_alive():
+                with self._worker_lock:
+                    self._worker_threads.pop(lane_key, None)
+                    self._dispatch_queues.pop(lane_key, None)
+
+    def _worker_loop(self, lane_key: str, dispatch_queue: queue.Queue[AutomationRequest | None]) -> None:
         while True:
-            request = self._dispatch_queue.get()
+            request = dispatch_queue.get()
             try:
                 if request is None:
+                    with self._worker_lock:
+                        self._worker_threads.pop(lane_key, None)
+                        self._dispatch_queues.pop(lane_key, None)
                     return
                 try:
                     result = self.dispatcher(request)
@@ -165,4 +187,4 @@ class AutomationScheduler:
                 except Exception:
                     logger.exception("scheduler worker failed to dispatch job", extra={"job_name": request.job_name})
             finally:
-                self._dispatch_queue.task_done()
+                dispatch_queue.task_done()

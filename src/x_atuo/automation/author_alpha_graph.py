@@ -28,6 +28,8 @@ from x_atuo.core.twitter_client import TwitterClientError
 from x_atuo.core.twitter_models import TweetRecord, TwitterCommandResult
 from x_atuo.core.x_web_notifications import XWebNotificationsError
 
+AUTHOR_ALPHA_DEVICE_FOLLOW_FEED_COUNT = 50
+
 
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
@@ -74,6 +76,7 @@ class ReplyClientProtocol(Protocol):
 
 class SharedEngagementStorageProtocol(Protocol):
     def has_target_tweet_id(self, target_tweet_id: str, *, exclude_workflows: tuple[str, ...] | None = None) -> bool: ...
+    def get_global_daily_execution_count(self, metric_date: str) -> int: ...
     def record_shared_engagement(
         self,
         *,
@@ -276,7 +279,7 @@ class AuthorAlphaExecutionGraph:
         }
         payload = await self._call_with_retries(
             lambda: self.candidate_source.fetch_device_follow_feed(
-                count=max(1, int(self.config.author_alpha.device_follow_feed_count))
+                count=AUTHOR_ALPHA_DEVICE_FOLLOW_FEED_COUNT
             ),
             operation="device-follow fetch",
         )
@@ -565,8 +568,17 @@ class AuthorAlphaExecutionGraph:
         return None
 
     def _daily_limit_reached(self) -> bool:
-        limit = int(self.config.author_alpha.daily_execution_limit)
-        return self._global_daily_success_count(self._metric_date(self._now())) >= limit
+        metric_date = self._metric_date(self._now())
+        global_metric_date = self._now().astimezone(UTC).date().isoformat()
+        shared_reader = getattr(self.shared_storage, "get_global_daily_execution_count", None)
+        shared_limit = self.config.policies.global_daily_execution_limit
+        if shared_limit is not None and callable(shared_reader):
+            if int(shared_reader(global_metric_date)) >= int(shared_limit):
+                return True
+        limit = self.config.author_alpha.daily_execution_limit
+        if limit is None:
+            return False
+        return self._global_daily_success_count(metric_date) >= int(limit)
 
     def _global_daily_success_count(self, metric_date: str) -> int:
         reader = getattr(self.storage, "get_daily_success_count", None)

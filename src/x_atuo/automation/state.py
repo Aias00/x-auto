@@ -31,6 +31,7 @@ class WorkflowKind(str, Enum):
 
     FEED_ENGAGE = "feed-engage"
     AUTHOR_ALPHA_ENGAGE = "author-alpha-engage"
+    AUTHOR_ALPHA_RECONCILE = "author-alpha-reconcile"
 
 
 class RunStatus(str, Enum):
@@ -123,7 +124,7 @@ class AutomationRequest(BaseModel):
             self.approval_mode = "ai_auto"
             if self.feed_options is None:
                 self.feed_options = _default_feed_options()
-        elif self.workflow is WorkflowKind.AUTHOR_ALPHA_ENGAGE:
+        elif self.workflow in {WorkflowKind.AUTHOR_ALPHA_ENGAGE, WorkflowKind.AUTHOR_ALPHA_RECONCILE}:
             self.feed_options = None
         return self
 
@@ -152,6 +153,18 @@ class AutomationRequest(BaseModel):
         return cls(
             workflow=WorkflowKind.AUTHOR_ALPHA_ENGAGE,
             reply_text=reply_text,
+            feed_options=None,
+            **kwargs,
+        )
+
+    @classmethod
+    def for_author_alpha_reconcile(
+        cls,
+        **kwargs: Any,
+    ) -> "AutomationRequest":
+        return cls(
+            workflow=WorkflowKind.AUTHOR_ALPHA_RECONCILE,
+            reply_text=None,
             feed_options=None,
             **kwargs,
         )

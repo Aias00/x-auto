@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import import_module
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -74,6 +76,8 @@ from x_atuo.core.x_web_notifications import (
 )
 from x_atuo.core.ai_client import AIProviderError, build_ai_provider
 from x_atuo.core.twitter_client import TwitterClient, TwitterClientError
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_db_path() -> Path:
@@ -337,27 +341,111 @@ async def _run_author_alpha_request(
     endpoint: str,
     proxy: str | None = None,
 ) -> dict[str, Any]:
-    notifications_client = XWebNotificationsClient.from_settings(settings)
-    twitter_client = TwitterClient.from_config(
-        settings.agent_reach_config_path,
-        proxy=proxy or settings.twitter.proxy_url,
-        twitter_bin=settings.twitter.cli_bin,
-        timeout=120,
+    max_attempts = 2
+    attempt = 1
+    while True:
+        try:
+            notifications_client = XWebNotificationsClient.from_settings(settings)
+            twitter_client = TwitterClient.from_config(
+                settings.agent_reach_config_path,
+                proxy=proxy or settings.twitter.proxy_url,
+                twitter_bin=settings.twitter.cli_bin,
+                timeout=120,
+            )
+            ai_provider = build_ai_provider(settings.ai)
+            if ai_provider is None:
+                raise AIProviderError("author-alpha-engage requires an AI provider")
+            snapshot = await run_author_alpha_engage(
+                request,
+                config=settings,
+                storage=storage,
+                shared_storage=shared_storage,
+                candidate_source=notifications_client,
+                drafter=ai_provider,
+                reply_client=twitter_client,
+                sleep=asyncio.sleep,
+            )
+            response = _snapshot_response(snapshot)
+            failure = _workflow_failure_marker(snapshot)
+            if failure is None or attempt >= max_attempts or not _is_retryable_author_alpha_failure(failure):
+                return response
+            _record_author_alpha_retry(
+                storage,
+                request=request,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                error=str(failure),
+            )
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_author_alpha_failure(exc):
+                raise
+            _record_author_alpha_retry(
+                storage,
+                request=request,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                error=str(exc),
+            )
+        attempt += 1
+        await asyncio.sleep(float(attempt))
+
+
+def _is_retryable_author_alpha_failure(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, TwitterClientError)):
+        return True
+    if isinstance(exc, AIProviderError):
+        message = str(exc).lower()
+        return any(
+            marker in message
+            for marker in (
+                "timed out",
+                "timeout",
+                "read operation timed out",
+                "http error 500",
+                "internal server error",
+            )
+        )
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "timed out",
+            "timeout",
+            "tls connect error",
+            "curl: (35)",
+            "curl: (28)",
+            "ssl",
+            "unexpected eof",
+            "eof occurred",
+            "remote end closed connection",
+            "connection reset",
+            "connection aborted",
+            "temporarily unavailable",
+        )
     )
-    ai_provider = build_ai_provider(settings.ai)
-    if ai_provider is None:
-        raise AIProviderError("author-alpha-engage requires an AI provider")
-    snapshot = await run_author_alpha_engage(
-        request,
-        config=settings,
-        storage=storage,
-        shared_storage=shared_storage,
-        candidate_source=notifications_client,
-        drafter=ai_provider,
-        reply_client=twitter_client,
-        sleep=asyncio.sleep,
+
+
+def _record_author_alpha_retry(
+    storage: AuthorAlphaStorage,
+    *,
+    request: AutomationRequest,
+    attempt: int,
+    max_attempts: int,
+    error: str,
+) -> None:
+    if not request.run_id:
+        return
+    storage.add_execution_audit_event(
+        run_id=request.run_id,
+        event_type="workflow_retry_scheduled",
+        node="service",
+        payload={
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "error": error,
+            "workflow": request.workflow.value,
+        },
     )
-    return _snapshot_response(snapshot)
 
 
 async def _execute_author_alpha_job(
@@ -605,6 +693,135 @@ def _build_scheduled_author_alpha(settings: AutomationConfig) -> ScheduledWorkfl
     )
 
 
+def _scheduled_author_alpha_reconcile_target_date(now: datetime | None = None) -> str:
+    anchor = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    return (anchor.date() - timedelta(days=1)).isoformat()
+
+
+def _build_scheduled_author_alpha_reconcile(settings: AutomationConfig) -> ScheduledWorkflow | None:
+    if not (
+        settings.scheduler.enabled
+        and settings.author_alpha.enabled
+        and settings.scheduler.author_alpha_reconcile_enabled
+    ):
+        return None
+    request_obj = AutomationRequest.for_author_alpha_reconcile(
+        job_name="scheduled-author-alpha-reconcile",
+        dry_run=True,
+        metadata={
+            "trigger": "scheduler",
+            "target_date_mode": "utc_yesterday",
+            "retry_delay_minutes": settings.scheduler.author_alpha_reconcile_retry_delay_minutes,
+        },
+    )
+    return ScheduledWorkflow(
+        job_id="scheduled-author-alpha-reconcile",
+        request=request_obj,
+        trigger="cron",
+        trigger_args={
+            "hour": settings.scheduler.author_alpha_reconcile_hour,
+            "minute": settings.scheduler.author_alpha_reconcile_minute,
+            "timezone": settings.scheduler.author_alpha_reconcile_timezone,
+        },
+        enabled=True,
+    )
+
+
+def _wait_for_author_alpha_sync_run(
+    manager: AuthorAlphaSyncManager,
+    run_id: str,
+    *,
+    timeout_seconds: float = 1800.0,
+    poll_seconds: float = 0.5,
+) -> dict[str, object] | None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        payload = manager.get_run(run_id)
+        if payload is not None and str(payload.get("status")) != "running":
+            return payload
+        time.sleep(poll_seconds)
+    return manager.get_run(run_id)
+
+
+def _is_retryable_author_alpha_sync_error(error: str | None) -> bool:
+    if not error:
+        return False
+    return _is_retryable_author_alpha_failure(RuntimeError(error))
+
+
+def _schedule_author_alpha_reconcile_retry(
+    *,
+    scheduler: AutomationScheduler,
+    target_date: str,
+    retry_delay_minutes: int,
+) -> None:
+    retry_at = datetime.now(timezone.utc) + timedelta(minutes=max(1, retry_delay_minutes))
+    scheduler.register_job(
+        ScheduledWorkflow(
+            job_id=f"scheduled-author-alpha-reconcile-retry-{target_date}",
+            request=AutomationRequest.for_author_alpha_reconcile(
+                job_name=f"scheduled-author-alpha-reconcile-retry-{target_date}",
+                dry_run=True,
+                metadata={
+                    "trigger": "scheduler_retry",
+                    "scheduled_retry": True,
+                    "target_date": target_date,
+                    "retry_delay_minutes": retry_delay_minutes,
+                },
+            ),
+            trigger="date",
+            trigger_args={"run_date": retry_at},
+            enabled=True,
+            replace_existing=True,
+        )
+    )
+
+
+def _dispatch_scheduled_author_alpha_reconcile(
+    request: AutomationRequest,
+    *,
+    settings: AutomationConfig,
+    manager: AuthorAlphaSyncManager,
+    scheduler: AutomationScheduler,
+) -> None:
+    target_date = str(request.metadata.get("target_date") or _scheduled_author_alpha_reconcile_target_date())
+    retry_delay_minutes = max(
+        1,
+        int(
+            request.metadata.get("retry_delay_minutes")
+            or settings.scheduler.author_alpha_reconcile_retry_delay_minutes
+        ),
+    )
+    scheduled_retry = bool(request.metadata.get("scheduled_retry"))
+    try:
+        accepted = manager.start_reconcile(target_date=target_date)
+    except AuthorAlphaSyncActiveError:
+        logger.warning(
+            "scheduled author-alpha reconcile skipped because another sync run is active",
+            extra={"target_date": target_date, "scheduled_retry": scheduled_retry},
+        )
+        return
+
+    run_id = str(accepted["run_id"])
+    payload = _wait_for_author_alpha_sync_run(manager, run_id)
+    if payload is None:
+        logger.warning(
+            "scheduled author-alpha reconcile timed out while waiting for sync completion",
+            extra={"run_id": run_id, "target_date": target_date},
+        )
+        return
+    if str(payload.get("status")) != "failed" or scheduled_retry:
+        return
+    error = str(payload.get("error") or "")
+    if not _is_retryable_author_alpha_sync_error(error):
+        return
+    _schedule_author_alpha_reconcile_retry(
+        scheduler=scheduler,
+        target_date=target_date,
+        retry_delay_minutes=retry_delay_minutes,
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = AutomationConfig()
@@ -619,7 +836,8 @@ async def lifespan(app: FastAPI):
     app.state.author_alpha_storage = author_alpha_storage
     app.state.settings = settings
     app.state.observability_runtime = observability_runtime
-    app.state.author_alpha_sync_manager = _build_author_alpha_sync_manager(settings, author_alpha_storage)
+    author_alpha_sync_manager = _build_author_alpha_sync_manager(settings, author_alpha_storage)
+    app.state.author_alpha_sync_manager = author_alpha_sync_manager
 
     scheduler = AutomationScheduler(
         settings.scheduler,
@@ -637,6 +855,17 @@ async def lifespan(app: FastAPI):
             reason="scheduler backlog full",
         ),
     )
+    reconcile_scheduler_holder: dict[str, AutomationScheduler] = {}
+    reconcile_scheduler = AutomationScheduler(
+        settings.scheduler,
+        lambda request_obj: _dispatch_scheduled_author_alpha_reconcile(
+            request_obj,
+            settings=settings,
+            manager=author_alpha_sync_manager,
+            scheduler=reconcile_scheduler_holder["scheduler"],
+        ),
+    )
+    reconcile_scheduler_holder["scheduler"] = reconcile_scheduler
     definitions = [
         ("scheduled_feed_engage", _build_scheduled_feed_engage(settings)),
         ("scheduled_author_alpha_engage", _build_scheduled_author_alpha(settings)),
@@ -646,15 +875,24 @@ async def lifespan(app: FastAPI):
             continue
         scheduler.register_job(definition)
         setattr(app.state, attr_name, definition)
+    reconcile_definition = _build_scheduled_author_alpha_reconcile(settings)
+    if reconcile_definition is not None:
+        reconcile_scheduler.register_job(reconcile_definition)
+        app.state.scheduled_author_alpha_reconcile = reconcile_definition
     app.state.scheduler = scheduler
+    app.state.author_alpha_reconcile_scheduler = reconcile_scheduler
     scheduler.maybe_start()
+    reconcile_scheduler.maybe_start()
     try:
         yield
     finally:
         try:
-            scheduler.shutdown(wait=False)
+            reconcile_scheduler.shutdown(wait=False)
         finally:
-            observability_runtime.shutdown()
+            try:
+                scheduler.shutdown(wait=False)
+            finally:
+                observability_runtime.shutdown()
 
 
 app = FastAPI(title="x-atuo automation API", lifespan=lifespan)

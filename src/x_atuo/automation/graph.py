@@ -865,6 +865,17 @@ class AutomationGraph:
         if hooks:
             count = hooks.get_daily_execution_count(snapshot.request.workflow, datetime.now(UTC).date())
             decisions.append(check_daily_limit(count=count, limit=self.config.policies.daily_execution_limit))
+            global_reader = getattr(hooks, "get_global_daily_execution_count", None)
+            if self.config.policies.global_daily_execution_limit is not None and callable(global_reader):
+                global_count = int(global_reader(datetime.now(UTC).date().isoformat()))
+                global_decision = PolicyDecision()
+                if global_count >= self.config.policies.global_daily_execution_limit:
+                    global_decision.allowed = False
+                    global_decision.reasons.append(
+                        "global daily execution limit reached "
+                        f"({global_count}/{self.config.policies.global_daily_execution_limit})"
+                    )
+                decisions.append(global_decision)
             if candidate.screen_name:
                 last_author_at = hooks.get_last_author_engagement(candidate.screen_name)
                 decisions.append(

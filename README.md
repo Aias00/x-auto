@@ -80,6 +80,7 @@ Twitter automation service for scheduler-driven reply workflows, with independen
 - author-alpha historical sync is a separate control surface
   - `POST /author-alpha/sync/bootstrap` backfills a date range day by day
   - `POST /author-alpha/sync/reconcile` refreshes one day, defaulting to yesterday in the configured lane timezone
+  - an optional scheduled reconcile job can run daily at `UTC 00:10` and, on retryable network failures, auto-retry once `30` minutes later
   - `POST /author-alpha/sync/stop` requests cooperative cancellation of the currently active bootstrap/reconcile run
   - `GET /author-alpha/sync/status` reports active/latest sync state and checkpoints
   - `GET /author-alpha/sync/history` lists recent sync runs
@@ -145,7 +146,6 @@ Notes:
   - `SCORE_MIN_DAILY_REPLIES` defaults to `400` and filters the score model to high-volume days only
   - `SCORE_PRIOR_WEIGHT` defaults to `7.0`
   - `SCORE_PENALTY_CONSTANT` defaults to `200.0`
-  - `DEVICE_FOLLOW_FEED_COUNT` defaults to `50`
   - `DAILY_EXECUTION_LIMIT` defaults to `700`
   - `GLOBAL_SEND_LIMIT_15M` defaults to `50`
   - `PER_AUTHOR_DAILY_SUCCESS_LIMIT` defaults to `100`
@@ -245,6 +245,16 @@ Reconcile one author-alpha day:
 curl -s -X POST http://127.0.0.1:18000/author-alpha/sync/reconcile \
   -H 'content-type: application/json' \
   -d '{"target_date":"2026-04-26"}' | jq
+```
+
+Enable scheduled author-alpha reconcile at `UTC 00:10` with one retry `30` minutes later:
+
+```bash
+X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_ENABLED=true
+X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_HOUR=0
+X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_MINUTE=10
+X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_TIMEZONE=UTC
+X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_RETRY_DELAY_MINUTES=30
 ```
 
 Stop the active author-alpha sync run:

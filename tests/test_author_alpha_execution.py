@@ -8,7 +8,7 @@ from urllib.error import URLError
 
 from x_atuo.automation.author_alpha_graph import AuthorAlphaExecutionGraph
 from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
-from x_atuo.automation.config import AutomationConfig, AuthorAlphaSettings
+from x_atuo.automation.config import AutomationConfig, AuthorAlphaSettings, PolicyConfig
 from x_atuo.automation.state import AutomationRequest, RunStatus
 from x_atuo.automation.storage import AutomationStorage
 from x_atuo.core.ai_client import AIDraftResult
@@ -182,6 +182,28 @@ def test_author_alpha_limits_targets_per_run(tmp_path: Path) -> None:
     assert snapshot.result is not None
     assert len(replier.calls) == 5
     assert [call["tweet_id"] for call in replier.calls] == [f"tweet-{i}" for i in range(1, 6)]
+
+
+def test_author_alpha_daily_limit_can_use_shared_global_limit(tmp_path: Path) -> None:
+    class FakeSharedStorage:
+        def get_global_daily_execution_count(self, metric_date: str) -> int:
+            assert metric_date == "2026-04-27"
+            return 5
+
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(daily_execution_limit=1000, global_daily_execution_limit=5),
+        storage=storage,
+        shared_storage=FakeSharedStorage(),
+        candidate_source=_FakeDeviceFollowFeedClient([]),
+        drafter=_FakeDrafter(),
+        reply_client=_FakeReplyClient(),
+        sleep=_SleepRecorder(),
+        now=lambda: datetime(2026, 4, 27, 1, 0, tzinfo=UTC),
+    )
+
+    assert graph._daily_limit_reached() is True
 
 
 def test_author_alpha_skips_recently_processed_target_until_revisit_cooldown_expires(tmp_path: Path) -> None:
@@ -788,10 +810,10 @@ def _config(
     timezone: str = "Asia/Shanghai",
     excluded_authors: list[str] | None = None,
     daily_execution_limit: int = 700,
+    global_daily_execution_limit: int | None = None,
     global_send_limit_15m: int = 50,
     per_author_daily_success_limit: int = 100,
     per_target_tweet_success_limit: int = 4,
-    device_follow_feed_count: int = 50,
     target_revisit_cooldown_seconds: int = 3600,
     max_targets_per_run: int = 5,
     per_run_same_target_burst_limit: int = 2,
@@ -799,12 +821,12 @@ def _config(
     target_switch_delay_seconds: int = 10,
 ) -> AutomationConfig:
     return AutomationConfig(
+        policies=PolicyConfig(global_daily_execution_limit=global_daily_execution_limit),
         author_alpha=AuthorAlphaSettings(
             enabled=True,
             timezone=timezone,
             excluded_authors=list(excluded_authors or []),
             daily_execution_limit=daily_execution_limit,
-            device_follow_feed_count=device_follow_feed_count,
             global_send_limit_15m=global_send_limit_15m,
             per_author_daily_success_limit=per_author_daily_success_limit,
             per_target_tweet_success_limit=per_target_tweet_success_limit,

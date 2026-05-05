@@ -42,6 +42,7 @@ class PolicyConfig(BaseModel):
     candidate_cache_claim_ttl_minutes: int = 10
     enforce_dedupe: bool = True
     daily_execution_limit: int | None = None
+    global_daily_execution_limit: int | None = None
     per_author_cooldown_minutes: int | None = None
 
 
@@ -61,6 +62,11 @@ class SchedulerSettings(BaseModel):
     feed_engage_hour: str | None = None
     feed_engage_day: str | None = None
     feed_engage_day_of_week: str | None = None
+    author_alpha_reconcile_enabled: bool = False
+    author_alpha_reconcile_minute: str = "10"
+    author_alpha_reconcile_hour: str = "0"
+    author_alpha_reconcile_timezone: str = "UTC"
+    author_alpha_reconcile_retry_delay_minutes: int = 30
 
 
 class AuthorAlphaSettings(BaseModel):
@@ -80,7 +86,6 @@ class AuthorAlphaSettings(BaseModel):
     score_min_daily_replies: int = 400
     score_prior_weight: float = 7.0
     score_penalty_constant: float = 200.0
-    device_follow_feed_count: int = 50
     daily_execution_limit: int = 700
     global_send_limit_15m: int = 50
     per_author_daily_success_limit: int = 100

@@ -20,6 +20,9 @@ class PolicyHooks(Protocol):
     def get_daily_execution_count(self, workflow: WorkflowKind, day: date) -> int:
         """Return the number of executions for the workflow on the given day."""
 
+    def get_global_daily_execution_count(self, metric_date: str) -> int:
+        """Return the total number of replies sent across workflows for the metric date."""
+
     def get_last_author_engagement(self, screen_name: str) -> datetime | None:
         """Return the last engagement timestamp for the author."""
 
@@ -132,6 +135,16 @@ def evaluate_policy(
     if hooks:
         count = hooks.get_daily_execution_count(request.workflow, now.date())
         decisions.append(check_daily_limit(count=count, limit=config.daily_execution_limit))
+        global_reader = getattr(hooks, "get_global_daily_execution_count", None)
+        if config.global_daily_execution_limit is not None and callable(global_reader):
+            global_count = int(global_reader(now.astimezone(UTC).date().isoformat()))
+            global_decision = PolicyDecision()
+            if global_count >= config.global_daily_execution_limit:
+                global_decision.allowed = False
+                global_decision.reasons.append(
+                    f"global daily execution limit reached ({global_count}/{config.global_daily_execution_limit})"
+                )
+            decisions.append(global_decision)
         if candidate and candidate.screen_name:
             last_author_at = hooks.get_last_author_engagement(candidate.screen_name)
             decisions.append(

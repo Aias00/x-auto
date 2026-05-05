@@ -827,6 +827,18 @@ class AutomationStorage:
             ).fetchone()
         return int(row["count"]) if row else 0
 
+    def get_global_daily_execution_count(self, metric_date: str) -> int:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM shared_engagements
+                WHERE date(created_at) = ?
+                """,
+                (metric_date,),
+            ).fetchone()
+        return int(row["count"]) if row else 0
+
     def get_last_author_engagement(self, screen_name: str) -> datetime | None:
         with self.connect() as connection:
             row = connection.execute(

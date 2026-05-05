@@ -68,8 +68,8 @@ def test_author_alpha_config_defaults() -> None:
 
     assert config.author_alpha.enabled is False
     assert config.author_alpha.excluded_authors == []
-    assert config.author_alpha.device_follow_feed_count == 50
     assert config.author_alpha.daily_execution_limit == 700
+    assert config.policies.global_daily_execution_limit is None
     assert config.author_alpha.global_send_limit_15m == 50
     assert config.author_alpha.posts_per_author == 1
     assert config.author_alpha.target_revisit_cooldown_seconds == 3600
@@ -80,6 +80,11 @@ def test_author_alpha_config_defaults() -> None:
     assert config.author_alpha.score_min_daily_replies == 400
     assert config.author_alpha.score_prior_weight == 7.0
     assert config.author_alpha.score_penalty_constant == 200.0
+    assert config.scheduler.author_alpha_reconcile_enabled is False
+    assert config.scheduler.author_alpha_reconcile_hour == "0"
+    assert config.scheduler.author_alpha_reconcile_minute == "10"
+    assert config.scheduler.author_alpha_reconcile_timezone == "UTC"
+    assert config.scheduler.author_alpha_reconcile_retry_delay_minutes == 30
 
 
 def test_author_alpha_request_builder_exists() -> None:
@@ -87,6 +92,14 @@ def test_author_alpha_request_builder_exists() -> None:
 
     assert request.workflow.value == "author-alpha-engage"
     assert request.job_name == "job"
+
+
+def test_author_alpha_reconcile_request_builder_exists() -> None:
+    request = AutomationRequest.for_author_alpha_reconcile(job_name="job")
+
+    assert request.workflow.value == "author-alpha-reconcile"
+    assert request.job_name == "job"
+    assert request.feed_options is None
 
 
 def test_local_dotenv_overrides_shell_env(tmp_path: Path, monkeypatch) -> None:
@@ -452,6 +465,44 @@ def test_policy_guard_retries_duplicate_candidate_before_releasing_claims() -> N
     assert result["snapshot"].selected_candidate is None
     assert [candidate.tweet_id for candidate in result["snapshot"].candidates] == ["222"]
     assert routed == "retry_candidate"
+
+
+def test_feed_engage_policy_guard_blocks_when_global_daily_execution_limit_is_reached() -> None:
+    class FakeHooks:
+        def has_dedupe_key(self, dedupe_key: str) -> bool:
+            return False
+
+        def get_daily_execution_count(self, workflow, day) -> int:
+            return 0
+
+        def get_global_daily_execution_count(self, metric_date: str) -> int:
+            return 5
+
+        def get_last_author_engagement(self, screen_name: str):
+            return None
+
+        def has_target_tweet_id(self, target_tweet_id: str) -> bool:
+            return False
+
+    graph = AutomationGraph(
+        AutomationConfig(policies=PolicyConfig(global_daily_execution_limit=5)),
+        WorkflowAdapters(policy_hooks=FakeHooks()),
+    )
+    request = AutomationRequest.for_feed_engage(job_name="job", reply_text="hello")
+    state = make_initial_state(request)
+    snapshot = state["snapshot"]
+    snapshot.selected_candidate = FeedCandidate(
+        tweet_id="111",
+        screen_name="author1",
+        text="preview one",
+        author_verified=True,
+    )
+    snapshot.rendered_text = "draft one"
+
+    result = asyncio.run(graph.policy_guard(state))
+
+    assert result["snapshot"].status is RunStatus.BLOCKED
+    assert any("global daily execution limit reached" in error for error in result["snapshot"].errors)
 
 
 def test_prefilter_candidates_filters_unverified_without_policy_hooks() -> None:
@@ -1115,6 +1166,126 @@ def test_scheduler_registers_author_alpha_job(monkeypatch, tmp_path: Path) -> No
         assert app.state.scheduled_author_alpha_engage.trigger_args["jitter"] == 23
 
 
+def test_scheduler_registers_author_alpha_reconcile_job(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "scheduler.sqlite3"))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTOSTART", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_HOUR", "0")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_MINUTE", "10")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_TIMEZONE", "UTC")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_RETRY_DELAY_MINUTES", "30")
+
+    with TestClient(app):
+        job_ids = app.state.author_alpha_reconcile_scheduler.list_job_ids()
+        assert "scheduled-author-alpha-reconcile" in job_ids
+        assert app.state.scheduled_author_alpha_reconcile.trigger_args["hour"] == "0"
+        assert app.state.scheduled_author_alpha_reconcile.trigger_args["minute"] == "10"
+        assert app.state.scheduled_author_alpha_reconcile.trigger_args["timezone"] == "UTC"
+        assert app.state.author_alpha_reconcile_scheduler is not app.state.scheduler
+
+
+def test_scheduler_dispatches_author_alpha_reconcile_for_utc_yesterday(monkeypatch, tmp_path: Path) -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+            self.called = threading.Event()
+
+        def start_reconcile(self, *, target_date: str | None = None):
+            self.calls.append(target_date)
+            self.called.set()
+            return {
+                "run_id": "reconcile-run-1",
+                "run_type": "reconcile",
+                "status": "accepted",
+                "target_date": target_date,
+            }
+
+        def get_run(self, run_id: str):
+            return {
+                "run_id": run_id,
+                "run_type": "reconcile",
+                "status": "completed",
+                "error": None,
+            }
+
+    fake_manager = FakeManager()
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "scheduler.sqlite3"))
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(tmp_path / "author-alpha.sqlite3"))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTOSTART", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_ENABLED", "true")
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: fake_manager)
+    monkeypatch.setattr(
+        automation_api,
+        "_scheduled_author_alpha_reconcile_target_date",
+        lambda now=None: "2026-05-01",
+    )
+
+    with TestClient(app):
+        definition = app.state.scheduled_author_alpha_reconcile
+        app.state.author_alpha_reconcile_scheduler._dispatch_job(definition.request)
+        assert fake_manager.called.wait(1.0)
+
+    assert fake_manager.calls == ["2026-05-01"]
+
+
+def test_scheduler_retries_author_alpha_reconcile_once_after_transient_failure(monkeypatch, tmp_path: Path) -> None:
+    class FakeManager:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+            self.called = threading.Event()
+
+        def start_reconcile(self, *, target_date: str | None = None):
+            self.calls.append(target_date)
+            self.called.set()
+            return {
+                "run_id": "reconcile-run-failed",
+                "run_type": "reconcile",
+                "status": "accepted",
+                "target_date": target_date,
+            }
+
+        def get_run(self, run_id: str):
+            return {
+                "run_id": run_id,
+                "run_type": "reconcile",
+                "status": "failed",
+                "error": "<urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol (_ssl.c:1016)>",
+            }
+
+    fake_manager = FakeManager()
+    monkeypatch.setenv("X_ATUO_DB_PATH", str(tmp_path / "scheduler.sqlite3"))
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__DB_PATH", str(tmp_path / "author-alpha.sqlite3"))
+    monkeypatch.setenv("X_ATUO_SCHEDULER__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTOSTART", "false")
+    monkeypatch.setenv("X_ATUO_AUTHOR_ALPHA__ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_ENABLED", "true")
+    monkeypatch.setenv("X_ATUO_SCHEDULER__AUTHOR_ALPHA_RECONCILE_RETRY_DELAY_MINUTES", "30")
+    monkeypatch.setattr(automation_api, "_build_author_alpha_sync_manager", lambda settings, storage: fake_manager)
+    monkeypatch.setattr(
+        automation_api,
+        "_scheduled_author_alpha_reconcile_target_date",
+        lambda now=None: "2026-05-01",
+    )
+
+    with TestClient(app):
+        definition = app.state.scheduled_author_alpha_reconcile
+        app.state.author_alpha_reconcile_scheduler._dispatch_job(definition.request)
+
+        deadline = time.monotonic() + 1.0
+        job_ids: list[str] = []
+        while time.monotonic() < deadline:
+            job_ids = app.state.author_alpha_reconcile_scheduler.list_job_ids()
+            if "scheduled-author-alpha-reconcile-retry-2026-05-01" in job_ids:
+                break
+            time.sleep(0.01)
+
+    assert "scheduled-author-alpha-reconcile-retry-2026-05-01" in job_ids
+
+
 def test_scheduler_dispatch_creates_author_alpha_execution_run(monkeypatch, tmp_path: Path) -> None:
     from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
 
@@ -1249,6 +1420,37 @@ def test_scheduler_dispatch_queue_processes_jobs_serially() -> None:
         scheduler.shutdown(wait=True)
 
 
+def test_scheduler_dispatch_runs_workflows_on_separate_workers() -> None:
+    lock = threading.Lock()
+    processed: list[str] = []
+    active = 0
+    max_active = 0
+    completed = threading.Event()
+
+    async def dispatcher(request: AutomationRequest) -> None:
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        await asyncio.sleep(0.15)
+        with lock:
+            processed.append(request.job_name or "")
+            active -= 1
+            if len(processed) == 2:
+                completed.set()
+
+    scheduler = AutomationScheduler(SchedulerSettings(enabled=True, autostart=False), dispatcher)
+    try:
+        scheduler._dispatch_job(AutomationRequest.for_feed_engage(job_name="feed-job"))
+        scheduler._dispatch_job(AutomationRequest.for_author_alpha_engage(job_name="author-job"))
+
+        assert completed.wait(timeout=1.0)
+        assert sorted(processed) == ["author-job", "feed-job"]
+        assert max_active == 2
+    finally:
+        scheduler.shutdown(wait=True)
+
+
 def test_scheduler_dispatch_queue_survives_dispatcher_exception() -> None:
     processed: list[str] = []
     completed = threading.Event()
@@ -1288,7 +1490,7 @@ def test_scheduler_drops_jobs_when_backlog_is_full() -> None:
         scheduler._dispatch_job(AutomationRequest.for_feed_engage(job_name="job-2"))
         scheduler._dispatch_job(AutomationRequest.for_feed_engage(job_name="job-3"))
 
-        assert scheduler._dispatch_queue.qsize() <= 5
+        assert scheduler._dispatch_queues["feed-engage"].qsize() <= 5
         release.set()
         assert completed.wait(timeout=1.0)
         assert processed == ["job-1", "job-2"]
@@ -2421,6 +2623,84 @@ def test_run_author_alpha_request_passes_real_asyncio_sleep(monkeypatch, tmp_pat
 
     assert result["status"] == "completed"
     assert captured["sleep"] is asyncio.sleep
+
+
+def test_run_author_alpha_request_retries_transient_whole_run_failure_once(monkeypatch, tmp_path: Path) -> None:
+    from urllib.error import URLError
+
+    from x_atuo.automation.author_alpha_storage import AuthorAlphaStorage
+    from x_atuo.automation.state import ExecutionResult, RunStatus, WorkflowStateModel
+
+    class FakeNotificationsClient:
+        pass
+
+    class FakeReplyClient:
+        pass
+
+    class FakeDrafter:
+        pass
+
+    calls = {"count": 0}
+
+    async def fake_run_author_alpha_engage(
+        request,
+        *,
+        config,
+        storage,
+        shared_storage,
+        candidate_source,
+        drafter,
+        reply_client,
+        sleep=None,
+        now=None,
+    ):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise URLError("temporary ssl eof")
+        return WorkflowStateModel(
+            run_id=request.run_id or "run-1",
+            request=request,
+            status=RunStatus.COMPLETED,
+            result=ExecutionResult(action="author_alpha_engage", ok=True, dry_run=True),
+        )
+
+    monkeypatch.setattr(automation_api.XWebNotificationsClient, "from_settings", lambda *args, **kwargs: FakeNotificationsClient())
+    monkeypatch.setattr(automation_api.TwitterClient, "from_config", lambda *args, **kwargs: FakeReplyClient())
+    monkeypatch.setattr(automation_api, "build_ai_provider", lambda settings: FakeDrafter())
+    monkeypatch.setattr(automation_api, "run_author_alpha_engage", fake_run_author_alpha_engage)
+
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    shared_storage = automation_api.AutomationStorage(tmp_path / "shared.sqlite3")
+    shared_storage.initialize()
+    request = AutomationRequest.for_author_alpha_engage(job_name="manual-author-alpha-engage", dry_run=True)
+    request.run_id = "retry-run-1"
+
+    result = asyncio.run(
+        automation_api._run_author_alpha_request(
+            request,
+            settings=AutomationConfig(),
+            storage=storage,
+            shared_storage=shared_storage,
+            endpoint="manual:author-alpha-engage",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert calls["count"] == 2
+    with storage.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT event_type, payload_json
+            FROM alpha_run_audit_events
+            WHERE run_id = 'retry-run-1'
+            ORDER BY id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+    assert row is not None
+    assert row["event_type"] == "workflow_retry_scheduled"
+    assert "temporary ssl eof" in str(row["payload_json"])
 
 
 def test_derive_status_maps_completed_with_errors_to_completed() -> None:
