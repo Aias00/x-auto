@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import time
 
 from x_atuo.core.twitter_client import TwitterClient, TwitterClientError
 from x_atuo.core.twitter_models import (
@@ -20,11 +21,39 @@ def is_reply_restricted(result: TwitterCommandResult) -> bool:
     return "restricted who can reply" in message or "(433)" in message
 
 
+def _is_retryable_reply_failure(result: TwitterCommandResult) -> bool:
+    if result.ok:
+        return False
+    message = (result.error_message or "").strip().lower()
+    if not message:
+        return False
+    retryable_markers = (
+        "timed out",
+        "timeout",
+        "tls connect error",
+        "curl: (35)",
+        "ssl",
+        "unexpected eof",
+        "eof occurred",
+        "remote end closed connection",
+        "connection reset",
+        "connection aborted",
+    )
+    return any(marker in message for marker in retryable_markers)
+
+
 class TwitterEngageService:
     """Deterministic service for feed-driven and explicit engagement flows."""
 
     def __init__(self, client: TwitterClient):
         self.client = client
+
+    def _reply_with_retry(self, tweet_id: str, reply_text: str) -> TwitterCommandResult:
+        result = self.client.reply(tweet_id, reply_text)
+        if result.ok or not _is_retryable_reply_failure(result):
+            return result
+        time.sleep(0.75)
+        return self.client.reply(tweet_id, reply_text)
 
     def engage_from_feed(
         self,
@@ -145,7 +174,7 @@ class TwitterEngageService:
                     reply_result=reply_result,
                 )
 
-            reply_result = self.client.reply(candidate.tweet_id, candidate.reply_text)
+            reply_result = self._reply_with_retry(candidate.tweet_id, candidate.reply_text)
             if not reply_result.ok and is_reply_restricted(reply_result):
                 attempts.append(
                     CandidateAttempt(

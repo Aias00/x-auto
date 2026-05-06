@@ -32,6 +32,21 @@ def _strip_internal_metadata(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _parse_transient_reply_failure_count(reason: str | None) -> int:
+    if not isinstance(reason, str):
+        return 0
+    prefix = "transient reply failure #"
+    text = reason.strip()
+    if not text.startswith(prefix):
+        return 0
+    remainder = text[len(prefix):]
+    count_text, _, _ = remainder.partition(":")
+    try:
+        return max(0, int(count_text.strip()))
+    except ValueError:
+        return 0
+
+
 class AutomationStorage:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path).expanduser().resolve()
@@ -529,6 +544,49 @@ class AutomationStorage:
                 """,
                 (reason, expires_at, utcnow(), workflow, tweet_id),
             )
+
+    def record_transient_candidate_failure(
+        self,
+        *,
+        workflow: str,
+        tweet_id: str,
+        reason: str,
+        max_pending_failures: int,
+        rejected_expires_at: str,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT reason
+                FROM candidate_cache
+                WHERE workflow = ? AND tweet_id = ?
+                """,
+                (workflow, tweet_id),
+            ).fetchone()
+            failure_count = _parse_transient_reply_failure_count(row["reason"] if row is not None else None) + 1
+            next_reason = f"transient reply failure #{failure_count}: {reason}"
+            if failure_count > max_pending_failures:
+                connection.execute(
+                    """
+                    UPDATE candidate_cache
+                    SET status = 'rejected', reason = ?, expires_at = ?, claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+                    WHERE workflow = ? AND tweet_id = ?
+                    """,
+                    (next_reason, rejected_expires_at, now, workflow, tweet_id),
+                )
+                return {"failure_count": failure_count, "rejected": True, "reason": next_reason}
+
+            connection.execute(
+                """
+                UPDATE candidate_cache
+                SET status = 'pending', reason = ?, claim_run_id = NULL, claim_expires_at = NULL, updated_ts = ?
+                WHERE workflow = ? AND tweet_id = ?
+                """,
+                (next_reason, now, workflow, tweet_id),
+            )
+            return {"failure_count": failure_count, "rejected": False, "reason": next_reason}
 
     def consume_candidate_cache(self, *, workflow: str, tweet_id: str) -> None:
         with self.connect() as connection:

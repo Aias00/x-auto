@@ -453,6 +453,61 @@ def test_author_alpha_reports_partial_success_when_one_target_cannot_be_replied_
     ]
 
 
+def test_author_alpha_backfills_next_target_after_failed_target(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "author_1", author_score=100, impressions_total_7d=100)
+    _upsert_author(storage, "author_2", author_score=90, impressions_total_7d=90)
+    _upsert_author(storage, "author_3", author_score=80, impressions_total_7d=80)
+
+    class PartialFailureReplyClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def reply(self, tweet_id: str, text: str) -> TwitterCommandResult:
+            self.calls.append({"tweet_id": tweet_id, "text": text})
+            if tweet_id == "tweet-2":
+                return TwitterCommandResult(
+                    action="reply",
+                    ok=False,
+                    target_tweet_id=tweet_id,
+                    error_message="Twitter API returned errors: Authorization: The original Tweet author restricted who can reply to this Tweet. (433)",
+                )
+            return TwitterCommandResult(
+                action="reply",
+                ok=True,
+                target_tweet_id=tweet_id,
+                tweet_id=f"reply-{len(self.calls)}",
+                text=text,
+            )
+
+    replier = PartialFailureReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=2, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [
+                _feed_post("tweet-1", "author_1"),
+                _feed_post("tweet-2", "author_2"),
+                _feed_post("tweet-3", "author_3"),
+            ]
+        ),
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert snapshot.status is RunStatus.COMPLETED_WITH_ERRORS
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-1", "tweet-2", "tweet-3"]
+    assert snapshot.result.detail["attempted_target_count"] == 3
+    assert snapshot.result.detail["successful_target_count"] == 2
+    assert snapshot.result.detail["failed_target_count"] == 1
+    assert snapshot.result.detail["consumed_target_tweet_ids"] == ["tweet-1", "tweet-3"]
+
+
 def test_author_alpha_does_not_retry_reply_writes(tmp_path: Path) -> None:
     storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
     storage.initialize()

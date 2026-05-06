@@ -91,6 +91,27 @@ def _is_retryable_ai_draft_error(exc: Exception) -> bool:
     )
 
 
+def _is_retryable_reply_failure_reason(reason: str | None) -> bool:
+    normalized = str(reason or "").strip().lower()
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "tls connect error",
+            "curl: (35)",
+            "ssl",
+            "unexpected eof",
+            "eof occurred",
+            "remote end closed connection",
+            "connection reset",
+            "connection aborted",
+        )
+    )
+
+
 def _is_moderation_exempt_candidate(candidate: FeedCandidate) -> bool:
     return (candidate.screen_name or "").strip().lower() == "elonmusk"
 
@@ -263,6 +284,21 @@ def _draft_payload_bytes(candidate: FeedCandidate) -> int:
             build_draft_prompt_payload(candidate),
             ensure_ascii=False,
         ).encode("utf-8")
+    )
+
+
+def _feed_candidate_from_tweet(tweet: TweetRecord) -> FeedCandidate:
+    return FeedCandidate(
+        tweet_id=tweet.tweet_id,
+        screen_name=tweet.screen_name,
+        text=tweet.text,
+        created_at=getattr(tweet, "created_at", None),
+        author_verified=tweet.verified,
+        can_reply=getattr(tweet, "can_reply", None),
+        reply_limit_reason=getattr(tweet, "reply_limit_reason", None),
+        reply_limit_headline=getattr(tweet, "reply_limit_headline", None),
+        reply_restriction_policy=getattr(tweet, "reply_restriction_policy", None),
+        metadata=tweet.raw,
     )
 
 
@@ -1028,19 +1064,44 @@ class AutomationGraph:
             result,
             selected_candidate=snapshot.selected_candidate,
         )
-        if not snapshot.request.dry_run and snapshot.selected_candidate is not None and hasattr(self.adapters.policy_hooks, "consume_candidate_cache"):
+        if (
+            not snapshot.request.dry_run
+            and snapshot.selected_candidate is not None
+            and hasattr(self.adapters.policy_hooks, "consume_candidate_cache")
+        ):
             if result.ok:
                 self.adapters.policy_hooks.consume_candidate_cache(
                     workflow="feed_engage",
                     tweet_id=snapshot.selected_candidate.tweet_id,
                 )
             elif rejection_reason:
-                self.adapters.policy_hooks.reject_candidate_cache(
-                    workflow="feed_engage",
-                    tweet_id=snapshot.selected_candidate.tweet_id,
-                    reason=rejection_reason,
-                    expires_at=(datetime.now(UTC) + timedelta(minutes=self.config.policies.candidate_cache_rejected_ttl_minutes)).isoformat(),
-                )
+                transient_failure_writer = getattr(self.adapters.policy_hooks, "record_transient_candidate_failure", None)
+                if callable(transient_failure_writer) and _is_retryable_reply_failure_reason(rejection_reason):
+                    transient_result = transient_failure_writer(
+                        workflow="feed_engage",
+                        tweet_id=snapshot.selected_candidate.tweet_id,
+                        reason=rejection_reason,
+                        max_pending_failures=2,
+                        rejected_expires_at=(
+                            datetime.now(UTC)
+                            + timedelta(minutes=self.config.policies.candidate_cache_rejected_ttl_minutes)
+                        ).isoformat(),
+                    )
+                    snapshot.log_event(
+                        "execute",
+                        "transient reply failure recorded on candidate cache",
+                        tweet_id=snapshot.selected_candidate.tweet_id,
+                        failure_count=int(transient_result.get("failure_count") or 0),
+                        rejected=bool(transient_result.get("rejected")),
+                        reason=str(transient_result.get("reason") or rejection_reason),
+                    )
+                else:
+                    self.adapters.policy_hooks.reject_candidate_cache(
+                        workflow="feed_engage",
+                        tweet_id=snapshot.selected_candidate.tweet_id,
+                        reason=rejection_reason,
+                        expires_at=(datetime.now(UTC) + timedelta(minutes=self.config.policies.candidate_cache_rejected_ttl_minutes)).isoformat(),
+                    )
         attempts = self._extract_execution_attempts(result)
         if (
             not result.ok
@@ -1126,8 +1187,8 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
         elif list_pending_candidate_cache is not None:
             cached = list_pending_candidate_cache(workflow="feed_engage", limit=options.feed_count)
 
+        candidates: list[FeedCandidate] = []
         if cached:
-            candidates: list[FeedCandidate] = []
             for item in cached:
                 created_at_raw = item.get("created_at")
                 created_at = None
@@ -1158,37 +1219,31 @@ def _build_runtime_graph(config: AutomationConfig, storage: PolicyHooks | Any, *
                         metadata=metadata,
                     )
                 )
-            snapshot.stash_runtime_observability(
-                "fetch_feed",
-                candidate_source="cache",
-                cache_hit_count=len(candidates),
-                duration_ms=round((perf_counter() - started_at) * 1000, 2),
-            )
-            return candidates
+        cached_count = len(candidates)
+        if cached_count < options.feed_count:
+            cached_ids = {candidate.tweet_id for candidate in candidates}
+            tweets = service.client.fetch_feed(max_items=options.feed_count, feed_type=options.feed_type)
+            for tweet in tweets:
+                if tweet.tweet_id in cached_ids:
+                    continue
+                candidates.append(_feed_candidate_from_tweet(tweet))
+                cached_ids.add(tweet.tweet_id)
 
-        tweets = service.client.fetch_feed(max_items=options.feed_count, feed_type=options.feed_type)
-        candidates = [
-            FeedCandidate(
-                tweet_id=tweet.tweet_id,
-                screen_name=tweet.screen_name,
-                text=tweet.text,
-                created_at=getattr(tweet, "created_at", None),
-                author_verified=tweet.verified,
-                can_reply=getattr(tweet, "can_reply", None),
-                reply_limit_reason=getattr(tweet, "reply_limit_reason", None),
-                reply_limit_headline=getattr(tweet, "reply_limit_headline", None),
-                reply_restriction_policy=getattr(tweet, "reply_restriction_policy", None),
-                metadata=tweet.raw,
-            )
-            for tweet in tweets
-        ]
         with_created_at = [candidate for candidate in candidates if candidate.created_at is not None]
         without_created_at = [candidate for candidate in candidates if candidate.created_at is None]
         with_created_at.sort(key=lambda candidate: candidate.created_at, reverse=True)
+        live_fetch_count = max(len(candidates) - cached_count, 0)
+        if cached_count and live_fetch_count:
+            candidate_source = "cache+feed"
+        elif cached_count:
+            candidate_source = "cache"
+        else:
+            candidate_source = "feed"
         snapshot.stash_runtime_observability(
             "fetch_feed",
-            candidate_source="feed",
-            cache_hit_count=0,
+            candidate_source=candidate_source,
+            cache_hit_count=cached_count,
+            live_fetch_count=live_fetch_count,
             duration_ms=round((perf_counter() - started_at) * 1000, 2),
         )
         return [*with_created_at, *without_created_at]

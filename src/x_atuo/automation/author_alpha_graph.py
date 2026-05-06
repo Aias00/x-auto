@@ -131,11 +131,11 @@ class AuthorAlphaExecutionGraph:
 
         post_queue = await self._build_post_queue(authors, snapshot=snapshot)
         max_targets = max(1, int(self.config.author_alpha.max_targets_per_run))
-        post_queue = post_queue[:max_targets]
         snapshot.log_event(
             "build_queue",
             "built author-alpha post queue",
             queue_size=len(post_queue),
+            max_targets_per_run=max_targets,
             tweet_ids=[candidate.tweet_id for candidate in post_queue],
         )
 
@@ -144,6 +144,14 @@ class AuthorAlphaExecutionGraph:
         skipped_targets: list[dict[str, Any]] = []
 
         for index, candidate in enumerate(post_queue):
+            if len(consumed_target_tweet_ids) >= max_targets:
+                snapshot.log_event(
+                    "execute_burst",
+                    "stopping run after successful target budget reached",
+                    successful_target_count=len(consumed_target_tweet_ids),
+                    max_targets_per_run=max_targets,
+                )
+                break
             snapshot.selected_candidate = candidate
             if candidate.tweet_id in consumed_target_tweet_ids:
                 skipped_targets.append(
@@ -181,7 +189,8 @@ class AuthorAlphaExecutionGraph:
                 continue
             sent_replies.extend(burst_replies)
             skipped_targets.extend(burst_skipped)
-            consumed_target_tweet_ids.add(candidate.tweet_id)
+            if burst_replies:
+                consumed_target_tweet_ids.add(candidate.tweet_id)
 
             if self._daily_limit_reached():
                 snapshot.log_event(
@@ -191,7 +200,7 @@ class AuthorAlphaExecutionGraph:
                 )
                 break
 
-            if index < len(post_queue) - 1:
+            if index < len(post_queue) - 1 and len(consumed_target_tweet_ids) < max_targets:
                 await _maybe_await(self.sleep(int(self.config.author_alpha.target_switch_delay_seconds)))
 
         detail = {
