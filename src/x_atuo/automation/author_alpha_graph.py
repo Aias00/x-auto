@@ -29,6 +29,8 @@ from x_atuo.core.twitter_models import TweetRecord, TwitterCommandResult
 from x_atuo.core.x_web_notifications import XWebNotificationsError
 
 AUTHOR_ALPHA_DEVICE_FOLLOW_FEED_COUNT = 50
+AUTHOR_ALPHA_LOW_SCORE_SOFT_FLOOR = 200.0
+AUTHOR_ALPHA_STRONG_SIGNAL_WEIGHT = 120
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -336,9 +338,11 @@ class AuthorAlphaExecutionGraph:
             seen_tweet_ids.add(tweet_id)
         queue.sort(
             key=lambda candidate: (
-                -float(author_map.get(candidate.screen_name or "", {}).get("author_score") or 0),
+                self._low_score_bucket(candidate, author_map=author_map),
+                -self._effective_author_score_for_queue(candidate, author_map=author_map),
                 -int(author_map.get(candidate.screen_name or "", {}).get("reply_count_7d") or 0),
                 -float(author_map.get(candidate.screen_name or "", {}).get("avg_impressions_7d") or 0),
+                -self._candidate_signal_score(candidate),
                 candidate.screen_name or "",
                 candidate.tweet_id,
             )
@@ -351,6 +355,50 @@ class AuthorAlphaExecutionGraph:
                 remaining=len(queue),
             )
         return [candidate for candidate in queue if self._queue_reason(candidate) is None]
+
+    def _low_score_bucket(
+        self,
+        candidate: FeedCandidate,
+        *,
+        author_map: dict[str, dict[str, Any]],
+    ) -> int:
+        author_score = float(author_map.get(candidate.screen_name or "", {}).get("author_score") or 0)
+        if author_score >= AUTHOR_ALPHA_LOW_SCORE_SOFT_FLOOR:
+            return 0
+        return 0 if self._candidate_has_strong_realtime_signal(candidate) else 1
+
+    def _effective_author_score_for_queue(
+        self,
+        candidate: FeedCandidate,
+        *,
+        author_map: dict[str, dict[str, Any]],
+    ) -> float:
+        author_score = float(author_map.get(candidate.screen_name or "", {}).get("author_score") or 0)
+        if author_score >= AUTHOR_ALPHA_LOW_SCORE_SOFT_FLOOR:
+            return author_score
+        if not self._candidate_has_strong_realtime_signal(candidate):
+            return author_score
+        return author_score + min(float(self._candidate_signal_score(candidate)), AUTHOR_ALPHA_LOW_SCORE_SOFT_FLOOR)
+
+    @staticmethod
+    def _candidate_signal_score(candidate: FeedCandidate) -> int:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        metrics = metadata.get("public_metrics") if isinstance(metadata.get("public_metrics"), dict) else {}
+        likes = int(metrics.get("likes") or 0)
+        replies = int(metrics.get("replies") or 0)
+        reposts = int(metrics.get("reposts") or 0)
+        quotes = int(metrics.get("quotes") or 0)
+        return likes + replies * 3 + reposts * 4 + quotes * 2
+
+    def _candidate_has_strong_realtime_signal(self, candidate: FeedCandidate) -> bool:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        metrics = metadata.get("public_metrics") if isinstance(metadata.get("public_metrics"), dict) else {}
+        likes = int(metrics.get("likes") or 0)
+        replies = int(metrics.get("replies") or 0)
+        reposts = int(metrics.get("reposts") or 0)
+        quotes = int(metrics.get("quotes") or 0)
+        signal_score = self._candidate_signal_score(candidate)
+        return signal_score >= AUTHOR_ALPHA_STRONG_SIGNAL_WEIGHT or replies >= 15 or likes >= 80 or reposts >= 20
 
     async def _execute_candidate_burst(
         self,

@@ -76,6 +76,62 @@ def test_author_alpha_excludes_configured_authors_from_queue(tmp_path: Path) -> 
     assert [call["tweet_id"] for call in replier.calls] == ["tweet-open"]
 
 
+def test_author_alpha_soft_demotes_low_score_author_without_strong_signal(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "low_score", author_score=100, impressions_total_7d=1000)
+    _upsert_author(storage, "high_score", author_score=500, impressions_total_7d=500)
+
+    feed = _FakeDeviceFollowFeedClient(
+        [
+            _feed_post("tweet-low", "low_score", likes=2, replies=0, reposts=0, quotes=0),
+            _feed_post("tweet-high", "high_score", likes=1, replies=0, reposts=0, quotes=0),
+        ]
+    )
+    replier = _FakeReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=1, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=feed,
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-high"]
+
+
+def test_author_alpha_allows_low_score_author_with_strong_signal_to_compete(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "low_score", author_score=100, impressions_total_7d=1000)
+    _upsert_author(storage, "mid_score", author_score=210, impressions_total_7d=500)
+
+    feed = _FakeDeviceFollowFeedClient(
+        [
+            _feed_post("tweet-low", "low_score", likes=120, replies=20, reposts=5, quotes=3),
+            _feed_post("tweet-mid", "mid_score", likes=1, replies=0, reposts=0, quotes=0),
+        ]
+    )
+    replier = _FakeReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=1, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=feed,
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-low"]
+
+
 def test_author_alpha_skips_non_current_day_posts_before_queue(tmp_path: Path) -> None:
     storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
     storage.initialize()
@@ -1001,7 +1057,16 @@ def _tweet(tweet_id: str, screen_name: str) -> TweetRecord:
     )
 
 
-def _feed_post(tweet_id: str, screen_name: str, *, created_at: str | None = None) -> dict[str, object]:
+def _feed_post(
+    tweet_id: str,
+    screen_name: str,
+    *,
+    created_at: str | None = None,
+    likes: int = 0,
+    replies: int = 0,
+    reposts: int = 0,
+    quotes: int = 0,
+) -> dict[str, object]:
     if created_at is None:
         created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     return {
@@ -1015,7 +1080,7 @@ def _feed_post(tweet_id: str, screen_name: str, *, created_at: str | None = None
             "rest_id": f"rest-{screen_name}",
             "verified": True,
         },
-        "public_metrics": {"likes": 0, "replies": 0, "reposts": 0, "quotes": 0},
+        "public_metrics": {"likes": likes, "replies": replies, "reposts": reposts, "quotes": quotes},
         "reply_to_id": None,
     }
 
