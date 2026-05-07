@@ -9,3 +9,5 @@ __pycache__/
 .DS_Store
 
 .runtime/
+.x_atuo/
+author-alpha-continuation-bundle-2026-05-02.json
