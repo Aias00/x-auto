@@ -19,6 +19,7 @@ from x_atuo.automation.graph import WorkflowAdapters
 from x_atuo.automation.graph import _AI_MODERATION_METADATA_KEY
 from x_atuo.automation.graph import _candidate_current_day_reason
 from x_atuo.automation.graph import _build_runtime_graph
+from x_atuo.automation.graph import _persist_snapshot
 from x_atuo.automation.policies import build_dedupe_key
 from x_atuo.automation.scheduler import AutomationScheduler
 from x_atuo.automation.state import FeedCandidate
@@ -1236,6 +1237,164 @@ def test_record_engagement_persists_target_and_reply_urls(tmp_path: Path) -> Non
     ).fetchone()
     conn.close()
     assert row == ("https://x.com/demoauthor/status/111", "https://x.com/i/status/222")
+
+
+def test_global_daily_execution_count_uses_distinct_nonempty_reply_ids(tmp_path: Path) -> None:
+    storage = AutomationStorage(tmp_path / "engagement.sqlite3")
+    storage.initialize()
+
+    storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="run-1",
+        target_tweet_id="target-1",
+        target_author="author-1",
+        target_tweet_url=None,
+        reply_tweet_id="reply-1",
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-06T00:01:00+00:00",
+    )
+    storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="run-2",
+        target_tweet_id="target-2",
+        target_author="author-2",
+        target_tweet_url=None,
+        reply_tweet_id="reply-1",
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-06T00:02:00+00:00",
+    )
+    storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="run-3",
+        target_tweet_id="target-3",
+        target_author="author-3",
+        target_tweet_url=None,
+        reply_tweet_id=None,
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-06T00:03:00+00:00",
+    )
+    storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="run-4",
+        target_tweet_id="target-4",
+        target_author="author-4",
+        target_tweet_url=None,
+        reply_tweet_id="",
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-06T00:04:00+00:00",
+    )
+    storage.record_shared_engagement(
+        workflow="author-alpha-engage",
+        run_id="run-5",
+        target_tweet_id="target-5",
+        target_author="author-5",
+        target_tweet_url=None,
+        reply_tweet_id="reply-2",
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-06T00:05:00+00:00",
+    )
+    storage.record_shared_engagement(
+        workflow="feed_engage",
+        run_id="run-6",
+        target_tweet_id="target-6",
+        target_author="author-6",
+        target_tweet_url=None,
+        reply_tweet_id="reply-3",
+        reply_url=None,
+        followed=False,
+        created_at="2026-05-07T00:01:00+00:00",
+    )
+
+    assert storage.get_global_daily_execution_count("2026-05-06") == 2
+    assert storage.get_global_daily_execution_count("2026-05-07") == 1
+
+
+def test_persist_snapshot_skips_failed_feed_engagement_without_reply_id(tmp_path: Path) -> None:
+    storage = AutomationStorage(tmp_path / "engagement.sqlite3")
+    storage.initialize()
+    storage.upsert_job("job_seed", "feed_engage", config={})
+    storage.create_run(
+        run_id="run_seed",
+        job_id="job_seed",
+        job_type="feed_engage",
+        endpoint="seed",
+        request_payload={},
+        status="failed",
+    )
+
+    state = make_initial_state(AutomationRequest.for_feed_engage(reply_text="hello", job_name="job_seed"))
+    snapshot = state["snapshot"]
+    snapshot.run_id = "run_seed"
+    snapshot.selected_candidate = FeedCandidate(tweet_id="111", screen_name="demoauthor", text="hello")
+    snapshot.result = ExecutionResult(
+        action="engage",
+        ok=False,
+        dry_run=False,
+        target_tweet_id="111",
+        target_tweet_url="https://x.com/demoauthor/status/111",
+        created_tweet_id=None,
+        reply_url=None,
+        error="reply tls error",
+        detail={"status": "failed"},
+    )
+
+    _persist_snapshot(storage, snapshot)
+
+    conn = sqlite3.connect(tmp_path / "engagement.sqlite3")
+    engagement_count = conn.execute("SELECT COUNT(*) FROM engagements").fetchone()[0]
+    shared_count = conn.execute("SELECT COUNT(*) FROM shared_engagements").fetchone()[0]
+    conn.close()
+
+    assert engagement_count == 0
+    assert shared_count == 0
+
+
+def test_persist_snapshot_records_successful_feed_engagement_with_reply_id(tmp_path: Path) -> None:
+    storage = AutomationStorage(tmp_path / "engagement.sqlite3")
+    storage.initialize()
+    storage.upsert_job("job_seed", "feed_engage", config={})
+    storage.create_run(
+        run_id="run_seed",
+        job_id="job_seed",
+        job_type="feed_engage",
+        endpoint="seed",
+        request_payload={},
+        status="completed",
+    )
+
+    state = make_initial_state(AutomationRequest.for_feed_engage(reply_text="hello", job_name="job_seed"))
+    snapshot = state["snapshot"]
+    snapshot.run_id = "run_seed"
+    snapshot.selected_candidate = FeedCandidate(tweet_id="111", screen_name="demoauthor", text="hello")
+    snapshot.result = ExecutionResult(
+        action="engage",
+        ok=True,
+        dry_run=False,
+        target_tweet_id="111",
+        target_tweet_url="https://x.com/demoauthor/status/111",
+        created_tweet_id="222",
+        reply_url="https://x.com/i/status/222",
+        detail={"status": "executed"},
+    )
+
+    _persist_snapshot(storage, snapshot)
+
+    conn = sqlite3.connect(tmp_path / "engagement.sqlite3")
+    engagement_row = conn.execute(
+        "SELECT target_tweet_id, reply_tweet_id FROM engagements WHERE run_id = 'run_seed'"
+    ).fetchone()
+    shared_row = conn.execute(
+        "SELECT workflow, target_tweet_id, reply_tweet_id FROM shared_engagements WHERE run_id = 'run_seed'"
+    ).fetchone()
+    conn.close()
+
+    assert engagement_row == ("111", "222")
+    assert shared_row == ("feed_engage", "111", "222")
 
 
 def test_healthz() -> None:

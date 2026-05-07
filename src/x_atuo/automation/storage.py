@@ -889,7 +889,7 @@ class AutomationStorage:
         with self.connect() as connection:
             row = connection.execute(
                 """
-                SELECT COUNT(*) AS count
+                SELECT COUNT(DISTINCT NULLIF(reply_tweet_id, '')) AS count
                 FROM shared_engagements
                 WHERE date(created_at) = ?
                 """,

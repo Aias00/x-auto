@@ -453,6 +453,104 @@ def test_author_alpha_reports_partial_success_when_one_target_cannot_be_replied_
     ]
 
 
+def test_author_alpha_preflight_skips_reply_restricted_target_before_drafting(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "author_1", author_score=100, impressions_total_7d=100)
+    _upsert_author(storage, "author_2", author_score=90, impressions_total_7d=90)
+
+    class PreflightReplyClient(_FakeReplyClient):
+        def fetch_tweet(self, tweet_id: str) -> TweetRecord:
+            if tweet_id == "tweet-1":
+                return TweetRecord(
+                    tweet_id=tweet_id,
+                    text="restricted target",
+                    author=TweetAuthor(screen_name="author_1", verified=True),
+                    created_at=datetime.now(UTC),
+                    can_reply=False,
+                    reply_limit_reason="Only some accounts can reply.",
+                    raw={"created_at": datetime.now(UTC).isoformat()},
+                )
+            return TweetRecord(
+                tweet_id=tweet_id,
+                text="open target",
+                author=TweetAuthor(screen_name="author_2", verified=True),
+                created_at=datetime.now(UTC),
+                can_reply=True,
+                raw={"created_at": datetime.now(UTC).isoformat()},
+            )
+
+    replier = PreflightReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=1, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [
+                _feed_post("tweet-1", "author_1"),
+                _feed_post("tweet-2", "author_2"),
+            ]
+        ),
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-2"]
+    assert any(
+        event.message == "candidate skipped during preflight" and event.payload["tweet_id"] == "tweet-1"
+        for event in snapshot.events
+    )
+
+
+def test_author_alpha_preflight_skips_deleted_target_on_fetch_error(tmp_path: Path) -> None:
+    storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
+    storage.initialize()
+    _upsert_author(storage, "author_1", author_score=100, impressions_total_7d=100)
+    _upsert_author(storage, "author_2", author_score=90, impressions_total_7d=90)
+
+    class PreflightReplyClient(_FakeReplyClient):
+        def fetch_tweet(self, tweet_id: str) -> TweetRecord:
+            if tweet_id == "tweet-1":
+                raise RuntimeError(
+                    "Twitter API returned errors: Authorization: You attempted to reply to a Tweet that is deleted or not visible to you. (385)"
+                )
+            return TweetRecord(
+                tweet_id=tweet_id,
+                text="open target",
+                author=TweetAuthor(screen_name="author_2", verified=True),
+                created_at=datetime.now(UTC),
+                can_reply=True,
+                raw={"created_at": datetime.now(UTC).isoformat()},
+            )
+
+    replier = PreflightReplyClient()
+    graph = AuthorAlphaExecutionGraph(
+        config=_config(max_targets_per_run=1, per_run_same_target_burst_limit=1),
+        storage=storage,
+        candidate_source=_FakeDeviceFollowFeedClient(
+            [
+                _feed_post("tweet-1", "author_1"),
+                _feed_post("tweet-2", "author_2"),
+            ]
+        ),
+        drafter=_FakeDrafter(),
+        reply_client=replier,
+        sleep=_SleepRecorder(),
+    )
+
+    snapshot = asyncio.run(graph.invoke(AutomationRequest.for_author_alpha_engage(job_name="job", dry_run=False)))
+
+    assert snapshot.result is not None
+    assert [call["tweet_id"] for call in replier.calls] == ["tweet-2"]
+    assert any(
+        event.message == "candidate skipped during preflight" and event.payload["tweet_id"] == "tweet-1"
+        for event in snapshot.events
+    )
+
+
 def test_author_alpha_backfills_next_target_after_failed_target(tmp_path: Path) -> None:
     storage = AuthorAlphaStorage(tmp_path / "author-alpha.sqlite3")
     storage.initialize()

@@ -1713,7 +1713,13 @@ def _persist_snapshot(storage: Any, snapshot: WorkflowStateModel) -> None:
     if snapshot.policy.dedupe_key and getattr(storage, "store_dedupe_key", None):
         expires_at = (datetime.now(UTC) + timedelta(minutes=240)).isoformat()
         storage.store_dedupe_key(snapshot.policy.dedupe_key, snapshot.request.workflow.value, expires_at)
-    if snapshot.result and snapshot.selected_candidate and getattr(storage, "record_engagement", None):
+    if (
+        snapshot.result
+        and snapshot.result.ok
+        and snapshot.result.created_tweet_id
+        and snapshot.selected_candidate
+        and getattr(storage, "record_engagement", None)
+    ):
         storage.record_engagement(
             run_id=snapshot.run_id,
             target_tweet_id=snapshot.selected_candidate.tweet_id,

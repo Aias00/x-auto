@@ -368,6 +368,17 @@ class AuthorAlphaExecutionGraph:
             )
             return [], [{"tweet_id": candidate.tweet_id, "screen_name": candidate.screen_name, "reason": reason}]
 
+        preflight_reason = await self._preflight_candidate(candidate, snapshot=snapshot, dry_run=snapshot.request.dry_run)
+        if preflight_reason is not None:
+            snapshot.log_event(
+                "execute_burst",
+                "candidate skipped during preflight",
+                tweet_id=candidate.tweet_id,
+                screen_name=candidate.screen_name,
+                reason=preflight_reason,
+            )
+            return [], [{"tweet_id": candidate.tweet_id, "screen_name": candidate.screen_name, "reason": preflight_reason}]
+
         sent_replies: list[dict[str, Any]] = []
         skipped_targets: list[dict[str, Any]] = []
         max_burst = max(1, int(self.config.author_alpha.per_run_same_target_burst_limit))
@@ -470,6 +481,51 @@ class AuthorAlphaExecutionGraph:
 
         return sent_replies, skipped_targets
 
+    async def _preflight_candidate(
+        self,
+        candidate: FeedCandidate,
+        *,
+        snapshot: WorkflowStateModel,
+        dry_run: bool,
+    ) -> str | None:
+        if dry_run:
+            return None
+        fetch_tweet = getattr(self.reply_client, "fetch_tweet", None)
+        if not callable(fetch_tweet):
+            return None
+        try:
+            refreshed = await self._call_with_retries(
+                lambda: fetch_tweet(candidate.tweet_id),
+                operation="preflight target",
+                snapshot=snapshot,
+                candidate=candidate,
+            )
+        except Exception as exc:
+            message = str(exc) or exc.__class__.__name__
+            if self._is_deterministic_target_unavailable(message):
+                return message
+            snapshot.log_event(
+                "preflight_target",
+                "candidate preflight failed but execution will continue",
+                tweet_id=candidate.tweet_id,
+                screen_name=candidate.screen_name,
+                error=message,
+            )
+            return None
+
+        candidate.created_at = getattr(refreshed, "created_at", None)
+        candidate.can_reply = getattr(refreshed, "can_reply", candidate.can_reply)
+        candidate.reply_limit_reason = getattr(refreshed, "reply_limit_reason", candidate.reply_limit_reason)
+        candidate.reply_limit_headline = getattr(refreshed, "reply_limit_headline", candidate.reply_limit_headline)
+        candidate.metadata = dict(getattr(refreshed, "raw", {}) or {})
+
+        current_day_reason = self._candidate_current_day_reason(candidate)
+        if current_day_reason is not None:
+            return current_day_reason
+        if candidate.can_reply is False:
+            return candidate.reply_limit_reason or candidate.reply_limit_headline or "target cannot be replied to"
+        return None
+
     async def _draft_text(
         self,
         candidate: FeedCandidate,
@@ -512,6 +568,21 @@ class AuthorAlphaExecutionGraph:
                 text=text,
             )
         return self.reply_client.reply(tweet_id, text)
+
+    @staticmethod
+    def _is_deterministic_target_unavailable(message: str) -> bool:
+        normalized = str(message or "").strip().lower()
+        if not normalized:
+            return False
+        deterministic_markers = (
+            "not permitted to engage with an outdated tweet",
+            "(461)",
+            "deleted or not visible",
+            "(385)",
+            "restricted who can reply",
+            "(433)",
+        )
+        return any(marker in normalized for marker in deterministic_markers)
 
     def _should_pause_before_next_reply(self, candidate: FeedCandidate, *, burst_index: int) -> bool:
         max_burst = max(1, int(self.config.author_alpha.per_run_same_target_burst_limit))
